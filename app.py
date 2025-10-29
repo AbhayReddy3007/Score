@@ -1,4 +1,4 @@
-# app.py
+# streamlit_gemini_abstract_extractor.py
 """
 Streamlit app — dataset-level extractor using Gemini 2.5-flash.
 
@@ -43,7 +43,7 @@ Read all abstracts and answer with exactly one JSON object (single-line) that co
 
 3) mash_resolution_counts -> object with integer counts of abstracts that reported MASH/NASH resolution as yes/no/unclear. Example: {"yes": 10, "no": 3, "unclear": 187}
 
-4) alt_resolution_counts -> object with integer counts of abstracts reporting ALT normalization/resolution as yes/no/unclear. Example: {"yes": 12, "no": 5, "unclear": 183}
+4) alt_reduction_counts -> object with integer counts of abstracts reporting ALT reduction/normalization as yes/no/unclear. Example: {"yes": 12, "no": 5, "unclear": 183}
 
 5) notes -> a short one-sentence caveat if needed (e.g., many abstracts lack numeric details), otherwise an empty string.
 
@@ -62,8 +62,10 @@ def extract_json(text: str) -> Optional[dict]:
         return None
     s = text.strip()
     # remove code fences if present
-    if s.startswith("```") and s.endswith("```"):
-        inner = "\n".join(s.split("\n")[1:-1]).strip()
+    if s.startswith("```") and s.endswith("``"):
+        inner = "
+".join(s.split("
+")[1:-1]).strip()
         if inner:
             s = inner
     # find first { and last }
@@ -124,7 +126,9 @@ all_abstracts = []
 for i, a in enumerate(df[abstract_col].astype(str), start=1):
     text = " ".join(a.split())  # collapse whitespace
     all_abstracts.append(f"{i}. {text}")
-combined = "\n\n".join(all_abstracts)
+combined = "
+
+".join(all_abstracts)
 
 # API key: check Streamlit secrets then environment
 api_key = None
@@ -182,7 +186,7 @@ if st.button("Analyze dataset"):
         st.error("Could not parse JSON from model response. Inspect the raw output above.")
         st.stop()
 
-    expected_keys = ["average_weight_loss_pct", "average_a1c_reduction_pct", "mash_resolution_counts", "alt_resolution_counts", "notes"]
+    expected_keys = ["average_weight_loss_pct", "average_a1c_reduction_pct", "mash_resolution_counts", "alt_reduction_counts", "notes"]
     missing = [k for k in expected_keys if k not in parsed]
     if missing:
         st.warning(f"Model returned JSON but missing expected keys: {missing} — displaying what was returned.")

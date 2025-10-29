@@ -1,4 +1,4 @@
-# streamlit_gemini_abstract_extractor.py
+# app.py
 """
 Streamlit app — dataset-level extractor using Gemini 2.5-flash.
 
@@ -33,41 +33,44 @@ OUTPUT_JSON = "overall_outcomes.json"
 DEFAULT_SLEEP = 0.25
 
 # Prompt used for the whole dataset: ask for a single JSON object output
-DATASET_PROMPT_TEMPLATE = """
-You are an extractor for clinical research abstracts. I will provide a numbered list of abstracts from multiple studies.
-Read all abstracts and answer with exactly one JSON object (single-line) that contains the following keys:
-
-1) average_weight_loss_pct -> numeric mean of reported weight-loss percentages across the abstracts that report it. If no abstracts report weight-loss %, return null.
-
-2) average_a1c_reduction_pct -> numeric mean of reported A1c absolute reductions (percentage points) across abstracts that report it. If abstracts report relative percent reductions treat them as percent values. If no abstracts report A1c change, return null.
-
-3) mash_resolution_counts -> object with integer counts of abstracts that reported MASH/NASH resolution as yes/no/unclear. Example: {"yes": 10, "no": 3, "unclear": 187}
-
-4) alt_reduction_counts -> object with integer counts of abstracts reporting ALT reduction/normalization as yes/no/unclear. Example: {"yes": 12, "no": 5, "unclear": 183}
-
-5) notes -> a short one-sentence caveat if needed (e.g., many abstracts lack numeric details), otherwise an empty string.
-
-Return only the JSON object and nothing else.
-
-Now analyze these abstracts:
-
------
-{all_abstracts}
------
-"""
+DATASET_PROMPT_TEMPLATE = (
+    "You are an extractor for clinical research abstracts. I will provide a numbered list of "
+    "abstracts from multiple studies.\n"
+    "Read all abstracts and answer with exactly one JSON object (single-line) that contains the "
+    "following keys:\n\n"
+    "1) average_weight_loss_pct -> numeric mean of reported weight-loss percentages across the "
+    "abstracts that report it. If no abstracts report weight-loss %, return null.\n\n"
+    "2) average_a1c_reduction_pct -> numeric mean of reported A1c absolute reductions (percentage "
+    "points) across abstracts that report it. If abstracts report relative percent reductions treat "
+    "them as percent values. If no abstracts report A1c change, return null.\n\n"
+    "3) mash_resolution_counts -> object with integer counts of abstracts that reported MASH/NASH "
+    "resolution as yes/no/unclear. Example: {\"yes\": 10, \"no\": 3, \"unclear\": 187}\n\n"
+    "4) alt_reduction_counts -> object with integer counts of abstracts reporting ALT "
+    "reduction/normalization as yes/no/unclear. Example: {\"yes\": 12, \"no\": 5, \"unclear\": 183}\n\n"
+    "5) notes -> a short one-sentence caveat if needed (e.g., many abstracts lack numeric details), "
+    "otherwise an empty string.\n\n"
+    "Return only the JSON object and nothing else.\n\n"
+    "Now analyze these abstracts:\n\n"
+    "-----\n"
+    "{all_abstracts}\n"
+    "-----\n"
+)
 
 # Helper: extract JSON object from text (robust)
 def extract_json(text: str) -> Optional[dict]:
     if not isinstance(text, str):
         return None
     s = text.strip()
+
     # remove code fences if present
-    if s.startswith("```") and s.endswith("``"):
-        inner = "
-".join(s.split("
-")[1:-1]).strip()
-        if inner:
-            s = inner
+    if s.startswith("```") and s.endswith("```"):
+        parts = s.split("\n")
+        # drop the first and last fence lines
+        if len(parts) > 2:
+            inner = "\n".join(parts[1:-1]).strip()
+            if inner:
+                s = inner
+
     # find first { and last }
     start = s.find("{")
     end = s.rfind("}")
@@ -77,7 +80,8 @@ def extract_json(text: str) -> Optional[dict]:
             return json.loads(s)
         except Exception:
             return None
-    candidate = s[start:end+1]
+
+    candidate = s[start : end + 1]
     try:
         return json.loads(candidate)
     except Exception:
@@ -88,10 +92,14 @@ def extract_json(text: str) -> Optional[dict]:
         except Exception:
             return None
 
+
 # Streamlit UI (minimal)
 st.set_page_config(page_title="Dataset-level Outcome Extractor", layout="wide")
 st.title("Dataset-level Outcome Extractor — Gemini 2.5-flash")
-st.write("Upload a CSV with a column named `abstract` (case-insensitive). The app will analyze all abstracts together and return dataset-level outcomes.")
+st.write(
+    "Upload a CSV with a column named `abstract` (case-insensitive). "
+    "The app will analyze all abstracts together and return dataset-level outcomes."
+)
 
 uploaded_file = st.file_uploader("Upload CSV file with abstracts", type=["csv"])
 if not uploaded_file:
@@ -126,9 +134,7 @@ all_abstracts = []
 for i, a in enumerate(df[abstract_col].astype(str), start=1):
     text = " ".join(a.split())  # collapse whitespace
     all_abstracts.append(f"{i}. {text}")
-combined = "
-
-".join(all_abstracts)
+combined = "\n\n".join(all_abstracts)
 
 # API key: check Streamlit secrets then environment
 api_key = None
@@ -141,7 +147,10 @@ if not api_key:
     api_key = os.environ.get("GEMINI_API_KEY")
 
 if not api_key:
-    st.error("No Gemini API key found. Set GEMINI_API_KEY in Streamlit secrets (.streamlit/secrets.toml) or as an environment variable.")
+    st.error(
+        "No Gemini API key found. Set GEMINI_API_KEY in Streamlit secrets (.streamlit/secrets.toml) "
+        "or as an environment variable."
+    )
     st.stop()
 
 if genai is None:
@@ -186,7 +195,13 @@ if st.button("Analyze dataset"):
         st.error("Could not parse JSON from model response. Inspect the raw output above.")
         st.stop()
 
-    expected_keys = ["average_weight_loss_pct", "average_a1c_reduction_pct", "mash_resolution_counts", "alt_reduction_counts", "notes"]
+    expected_keys = [
+        "average_weight_loss_pct",
+        "average_a1c_reduction_pct",
+        "mash_resolution_counts",
+        "alt_reduction_counts",
+        "notes",
+    ]
     missing = [k for k in expected_keys if k not in parsed]
     if missing:
         st.warning(f"Model returned JSON but missing expected keys: {missing} — displaying what was returned.")

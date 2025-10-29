@@ -16,7 +16,7 @@ Instructions:
 import os
 import json
 import time
-from typing import Optional
+from typing import Optional, Any
 
 import streamlit as st
 import pandas as pd
@@ -92,6 +92,69 @@ def extract_json(text: str) -> Optional[dict]:
         except Exception:
             return None
 
+# --- New: scoring helpers ---
+def safe_to_float(val: Any) -> Optional[float]:
+    """Try to convert value to float. Return None if not possible or null-like."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        s = val.strip()
+        if s == "" or s.lower() in {"null", "none", "n/a", "na"}:
+            return None
+        # remove percent signs etc
+        s = s.replace("%", "")
+        try:
+            return float(s)
+        except Exception:
+            return None
+    return None
+
+def score_weight_loss(pct: Optional[float]) -> int:
+    """
+    Weight loss % scoring:
+      5: >=22
+      4: 16 - 21.9
+      3: 10 - 15.9
+      2: 5 - 9.9
+      1: <5
+    If pct is None -> return 0
+    """
+    if pct is None:
+        return 0
+    if pct >= 22:
+        return 5
+    if 16 <= pct <= 21.9:
+        return 4
+    if 10 <= pct <= 15.9:
+        return 3
+    if 5 <= pct <= 9.9:
+        return 2
+    # any numeric <5
+    return 1
+
+def score_a1c_reduction(pct: Optional[float]) -> int:
+    """
+    A1c Reduction % scoring (absolute percentage points):
+      5: >=2.2
+      4: 1.8 - 2.1
+      3: 1.2 - 1.7
+      2: 0.8 - 1.1
+      1: <0.8
+    If pct is None -> return 0
+    """
+    if pct is None:
+        return 0
+    if pct >= 2.2:
+        return 5
+    if 1.8 <= pct <= 2.1:
+        return 4
+    if 1.2 <= pct <= 1.7:
+        return 3
+    if 0.8 <= pct <= 1.1:
+        return 2
+    return 1
 
 # Streamlit UI (minimal)
 st.set_page_config(page_title="Dataset-level Outcome Extractor", layout="wide")
@@ -195,6 +258,30 @@ if st.button("Analyze dataset"):
         st.error("Could not parse JSON from model response. Inspect the raw output above.")
         st.stop()
 
+    # --- New: compute scores and attach to parsed JSON ---
+    # pull reported averages and coerce to float if possible
+    avg_wt = safe_to_float(parsed.get("average_weight_loss_pct"))
+    avg_a1c = safe_to_float(parsed.get("average_a1c_reduction_pct"))
+
+    weight_points = score_weight_loss(avg_wt)
+    a1c_points = score_a1c_reduction(avg_a1c)
+    total_points = weight_points + a1c_points
+    MAX_POINTS = 10
+
+    # Attach scoring info to the parsed JSON (non-destructive)
+    parsed_with_scores = dict(parsed)  # shallow copy
+    parsed_with_scores.update(
+        {
+            "weight_score_points": weight_points,
+            "a1c_score_points": a1c_points,
+            "total_points": total_points,
+            "max_points": MAX_POINTS,
+            # include numeric values normalized to floats or nulls for clarity
+            "average_weight_loss_pct_normalized": avg_wt,
+            "average_a1c_reduction_pct_normalized": avg_a1c,
+        }
+    )
+
     expected_keys = [
         "average_weight_loss_pct",
         "average_a1c_reduction_pct",
@@ -207,10 +294,18 @@ if st.button("Analyze dataset"):
         st.warning(f"Model returned JSON but missing expected keys: {missing} — displaying what was returned.")
 
     st.subheader("Parsed JSON (dataset-level outcomes)")
-    st.json(parsed)
+    st.json(parsed_with_scores)
 
-    # Download button
-    out_bytes = json.dumps(parsed, indent=2).encode("utf-8")
-    st.download_button(label="Download outcomes JSON", data=out_bytes, file_name=OUTPUT_JSON, mime="application/json")
+    # Show a small summary box for scores
+    st.subheader("Scoring summary (max 10 points)")
+    st.markdown(
+        f"- Weight-loss average: **{avg_wt if avg_wt is not None else 'N/A'}**  → points: **{weight_points} / 5**\n"
+        f"- A1c reduction average: **{avg_a1c if avg_a1c is not None else 'N/A'}**  → points: **{a1c_points} / 5**\n"
+        f"- **Total points: {total_points} / {MAX_POINTS}**"
+    )
+
+    # Download button (includes scores)
+    out_bytes = json.dumps(parsed_with_scores, indent=2).encode("utf-8")
+    st.download_button(label="Download outcomes JSON (with scores)", data=out_bytes, file_name=OUTPUT_JSON, mime="application/json")
 
     st.success("Analysis complete.")

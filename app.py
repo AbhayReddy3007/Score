@@ -1,216 +1,284 @@
 # app.py
 """
-Streamlit app — dataset-level extractor using Gemini 2.5-flash.
+Overall drug scorer (one total score per drug, max 20) using exact thresholds provided.
 
-Instructions:
-- Put your Gemini API key in Streamlit secrets (.streamlit/secrets.toml):
-    GEMINI_API_KEY = "your_real_gemini_api_key_here"
-  Or export GEMINI_API_KEY as an environment variable (fallback).
-
-- Install dependencies:
-    pip install streamlit pandas google-genai
-
-- Run:
+Run:
+    pip install streamlit pandas
     streamlit run app.py
 """
-import os
-import json
-import time
-from typing import Optional
-
 import streamlit as st
 import pandas as pd
+import json
+from collections import Counter
 
-# lazy import genai to give helpful error if missing
-try:
-    from google import genai
-except Exception:
-    genai = None
+st.set_page_config(page_title="Drug Scorer (overall)", layout="wide")
+st.title("Drug Scorer — overall score per drug (max 20)")
 
-# CONFIG
-MODEL_NAME = "gemini-2.5-flash"
-OUTPUT_JSON = "overall_outcomes.json"
-DEFAULT_SLEEP = 0.25
-
-# Prompt used for the whole dataset: ask for a single JSON object output
-DATASET_PROMPT_TEMPLATE = (
-    "You are an extractor for clinical research abstracts. I will provide a numbered list of "
-    "abstracts from multiple studies.\n"
-    "Read all abstracts and answer with exactly one JSON object (single-line) that contains the "
-    "following keys:\n\n"
-    "1) average_weight_loss_pct -> numeric mean of reported weight-loss percentages across the "
-    "abstracts that report it. If no abstracts report weight-loss %, return null.\n\n"
-    "2) average_a1c_reduction_pct -> numeric mean of reported A1c absolute reductions (percentage "
-    "points) across abstracts that report it. If abstracts report relative percent reductions treat "
-    "them as percent values. If no abstracts report A1c change, return null.\n\n"
-    "3) mash_resolution_counts -> object with integer counts of abstracts that reported MASH/NASH "
-    "resolution as yes/no/unclear. Example: {\"yes\": 10, \"no\": 3, \"unclear\": 187}\n\n"
-    "4) alt_reduction_counts -> object with integer counts of abstracts reporting ALT "
-    "reduction/normalization as yes/no/unclear. Example: {\"yes\": 12, \"no\": 5, \"unclear\": 183}\n\n"
-    "5) notes -> a short one-sentence caveat if needed (e.g., many abstracts lack numeric details), "
-    "otherwise an empty string.\n\n"
-    "Return only the JSON object and nothing else.\n\n"
-    "Now analyze these abstracts:\n\n"
-    "-----\n"
-    "{all_abstracts}\n"
-    "-----\n"
-)
-
-# Helper: extract JSON object from text (robust)
-def extract_json(text: str) -> Optional[dict]:
-    if not isinstance(text, str):
-        return None
-    s = text.strip()
-
-    # remove code fences if present
-    if s.startswith("```") and s.endswith("```"):
-        parts = s.split("\n")
-        # drop the first and last fence lines
-        if len(parts) > 2:
-            inner = "\n".join(parts[1:-1]).strip()
-            if inner:
-                s = inner
-
-    # find first { and last }
-    start = s.find("{")
-    end = s.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        # try direct json load
-        try:
-            return json.loads(s)
-        except Exception:
-            return None
-
-    candidate = s[start : end + 1]
-    try:
-        return json.loads(candidate)
-    except Exception:
-        # small cleanup attempts
-        try:
-            cleaned = candidate.replace(",}", "}")
-            return json.loads(cleaned)
-        except Exception:
-            return None
-
-
-# Streamlit UI (minimal)
-st.set_page_config(page_title="Dataset-level Outcome Extractor", layout="wide")
-st.title("Dataset-level Outcome Extractor — Gemini 2.5-flash")
-st.write(
-    "Upload a CSV with a column named `abstract` (case-insensitive). "
-    "The app will analyze all abstracts together and return dataset-level outcomes."
-)
-
-uploaded_file = st.file_uploader("Upload CSV file with abstracts", type=["csv"])
-if not uploaded_file:
-    st.info("Upload a CSV to begin. Example header: 'abstract'")
+uploaded = st.file_uploader("Upload annotated CSV (prefer a 'drug' column).", type=["csv"])
+if not uploaded:
+    st.info("Upload a CSV (annotated by extractor or manually). Helpful column names (case-insensitive): "
+            "drug, weight_loss_pct, a1c_reduction_pct, alt_reduction_pct, alt_reduction_flag, "
+            "mash_resolution_with_no_worsening_pct, mash_resolution_pct, mash_fibrosis_worsening_pct, mash_resolution.")
     st.stop()
 
-# Read CSV
 try:
-    df = pd.read_csv(uploaded_file)
+    df = pd.read_csv(uploaded)
 except Exception as e:
-    st.error(f"Could not read uploaded CSV: {e}")
+    st.error(f"Could not read CSV: {e}")
     st.stop()
 
-# Locate abstract column (case-insensitive)
-abstract_col = None
-for c in df.columns:
-    if c.strip().lower() == "abstract":
-        abstract_col = c
-        break
+st.write("Detected columns:", ", ".join(df.columns.tolist()))
 
-if abstract_col is None:
-    st.error("CSV must contain an 'abstract' column (case-insensitive).")
-    st.stop()
+# case-insensitive column finder
+col_map = {c.lower().strip(): c for c in df.columns}
+def find(*names):
+    for n in names:
+        k = n.lower().strip()
+        if k in col_map:
+            return col_map[k]
+    return None
 
-st.success(f"Found abstract column '{abstract_col}' — {len(df)} rows.")
-st.markdown("#### Preview (first 5 abstracts)")
-for i, val in enumerate(df[abstract_col].astype(str).head(5), start=1):
-    st.write(f"{i}. {' '.join(val.split())}")
+drug_col = find("drug")
+wcol = find("weight_loss_pct", "weight loss pct", "weight_loss", "weight")
+a1ccol = find("a1c_reduction_pct", "a1c reduction pct", "a1c_reduction", "a1c")
+alt_num_col = find("alt_reduction_pct", "alt reduction pct", "alt_reduction", "alt")
+alt_flag_col = find("alt_reduction_flag", "alt_flag", "alt reduction flag")
+mash_no_worse_col = find("mash_resolution_with_no_worsening_pct", "mash_resolution_no_worse_pct", "mash_resolution_no_worsen_pct")
+mash_res_pct_col = find("mash_resolution_pct", "mash resolution pct", "mash_resolution")
+mash_fib_worse_col = find("mash_fibrosis_worsening_pct", "mash_fibrosis_worsen_pct", "mash_fibrosis_worsened_pct")
+mash_cat_col = find("mash_resolution", "mash resolution", "mash")
 
-# Prepare combined numbered abstracts
-all_abstracts = []
-for i, a in enumerate(df[abstract_col].astype(str), start=1):
-    text = " ".join(a.split())  # collapse whitespace
-    all_abstracts.append(f"{i}. {text}")
-combined = "\n\n".join(all_abstracts)
+st.markdown("### Preview (first 5 rows)")
+st.dataframe(df.head(5))
 
-# API key: check Streamlit secrets then environment
-api_key = None
-try:
-    api_key = st.secrets.get("GEMINI_API_KEY") if hasattr(st, "secrets") else None
-except Exception:
-    api_key = None
+st.markdown("---")
+st.write("Scoring uses fixed thresholds (no UI adjustments).")
 
-if not api_key:
-    api_key = os.environ.get("GEMINI_API_KEY")
+# Threshold functions (exact rules provided)
+def score_weight_mean(v):
+    if v is None:
+        return 1
+    try:
+        v = float(v)
+    except Exception:
+        return 1
+    if v >= 22.0:
+        return 5
+    if v >= 16.0:
+        return 4
+    if v >= 10.0:
+        return 3
+    if v >= 5.0:
+        return 2
+    return 1
 
-if not api_key:
-    st.error(
-        "No Gemini API key found. Set GEMINI_API_KEY in Streamlit secrets (.streamlit/secrets.toml) "
-        "or as an environment variable."
-    )
-    st.stop()
+def score_a1c_mean(v):
+    if v is None:
+        return 1
+    try:
+        v = float(v)
+    except Exception:
+        return 1
+    if v >= 2.2:
+        return 5
+    if v >= 1.8:
+        return 4
+    if v >= 1.2:
+        return 3
+    if v >= 0.8:
+        return 2
+    return 1
 
-if genai is None:
-    st.error("Missing dependency: google-genai. Install with `pip install google-genai`.")
-    st.stop()
+def score_alt_mean_percent(v):
+    # v = mean percent reduction from baseline
+    if v is None:
+        return 1
+    try:
+        v = float(v)
+    except Exception:
+        return 1
+    # note: "5: >50%" so strictly >50
+    if v > 50.0:
+        return 5
+    if 30.0 <= v <= 50.0:
+        return 4
+    if 15.0 <= v <= 29.0:
+        return 3
+    if 0.0 < v < 15.0:
+        return 2
+    # v <= 0 -> no reduction or increase
+    return 1
 
-# Button to analyze dataset
-if st.button("Analyze dataset"):
-    client = genai.Client(api_key=api_key)
-    prompt = DATASET_PROMPT_TEMPLATE.replace("{all_abstracts}", combined)
+# fallback mapping if only alt flag exists
+def score_alt_flag(c):
+    if not isinstance(c, str):
+        c = str(c) if pd.notna(c) else ""
+    c = c.strip().lower()
+    if c in ("yes", "y"):
+        # conservative mapping -> moderate signal
+        return 3
+    if c in ("no", "n"):
+        return 1
+    return 2  # unclear/mixed
 
-    with st.spinner("Sending dataset to Gemini and waiting for response — this may take a moment..."):
-        try:
-            response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-        except Exception as e:
-            st.error(f"API error when calling Gemini: {e}")
-            st.stop()
+# MASH scoring according to your rule
+def mash_score_from_group(group):
+    """
+    Priority:
+    1) If `mash_resolution_with_no_worsening_pct` available -> use it:
+       >=50 ->5, >=30 ->4, >0 ->3, 0 ->1
+    2) Else if mash_resolution_pct and mash_fibrosis_worsening_pct available:
+       estimate no_worse = max(0, res_pct - fib_worsen_pct) and apply same thresholds
+       if est_no_worse >0 but some fibrosis worsening exists -> give 3 per rule
+    3) Else if mash_resolution_pct only -> use res_pct but fibrosis unknown:
+       >=50 ->5, >=30 ->4, >0 ->3, 0 ->1
+    4) Else categorical mode on mash_resolution: map mixed->2, yes->3 (fibrosis unknown), no->1, unclear->2
+    """
+    # helper to compute mean of a numeric column in group
+    def mean_of(colname):
+        if colname is None or colname not in group.columns:
+            return None
+        vals = pd.to_numeric(group[colname], errors="coerce").dropna()
+        return float(vals.mean()) if len(vals)>0 else None
 
-    # Extract response text robustly
-    resp_text = ""
-    if hasattr(response, "text") and response.text:
-        resp_text = response.text
+    no_worse = mean_of(mash_no_worse_col)
+    res_pct = mean_of(mash_res_pct_col)
+    fib_worse = mean_of(mash_fib_worse_col)
+
+    # 1) explicit no-worse %
+    if no_worse is not None:
+        if no_worse >= 50.0:
+            return 5, {"method":"no_worse_pct","value":no_worse}
+        if no_worse >= 30.0:
+            return 4, {"method":"no_worse_pct","value":no_worse}
+        if no_worse > 0.0:
+            return 3, {"method":"no_worse_pct","value":no_worse}
+        return 1, {"method":"no_worse_pct","value":no_worse}
+
+    # 2) estimate from res_pct and fibrosis worsening
+    if res_pct is not None and fib_worse is not None:
+        est_no_worse = max(0.0, res_pct - fib_worse)
+        # if fibrosis worsening exists but resolution > 0 -> this falls into 3 if est_no_worse >0
+        if est_no_worse >= 50.0:
+            return 5, {"method":"estimated_no_worse","est":est_no_worse,"res_pct":res_pct,"fib_worse":fib_worse}
+        if est_no_worse >= 30.0:
+            return 4, {"method":"estimated_no_worse","est":est_no_worse,"res_pct":res_pct,"fib_worse":fib_worse}
+        if est_no_worse > 0.0:
+            # some resolution but fibrosis worsened for some -> 3
+            return 3, {"method":"estimated_no_worse","est":est_no_worse,"res_pct":res_pct,"fib_worse":fib_worse}
+        return 1, {"method":"estimated_no_worse","est":est_no_worse,"res_pct":res_pct,"fib_worse":fib_worse}
+
+    # 3) res_pct only, fibrosis unknown
+    if res_pct is not None:
+        if res_pct >= 50.0:
+            return 5, {"method":"res_pct_no_fib_info","value":res_pct}
+        if res_pct >= 30.0:
+            return 4, {"method":"res_pct_no_fib_info","value":res_pct}
+        if res_pct > 0.0:
+            return 3, {"method":"res_pct_no_fib_info","value":res_pct}
+        return 1, {"method":"res_pct_no_fib_info","value":res_pct}
+
+    # 4) categorical mode
+    if mash_cat_col is None or mash_cat_col not in group.columns:
+        return 2, {"method":"no_info","value":None}
+    cats = group[mash_cat_col].astype(str).fillna("").str.strip().str.lower()
+    cats = [c for c in cats if c != ""]
+    if not cats:
+        return 2, {"method":"no_info","value":None}
+    ctr = Counter(cats)
+    most = ctr.most_common()
+    if len(most) > 1 and most[0][1] == most[1][1]:
+        # tie => ambiguous
+        return 2, {"method":"categorical_mode_tie","value":most}
+    top = most[0][0]
+    if top in ("mixed","mixed results","ambiguous","inconclusive"):
+        return 2, {"method":"categorical_mode","value":top}
+    if top in ("yes","y","resolved","resolution"):
+        return 3, {"method":"categorical_mode","value":top}  # fibrosis unknown
+    if top in ("no","n"):
+        return 1, {"method":"categorical_mode","value":top}
+    return 2, {"method":"categorical_mode","value":top}
+
+# Group and compute
+if st.button("Compute overall scores per drug (fixed thresholds)"):
+    # group key
+    if drug_col is None:
+        df["_drug_group"] = "ALL_DATA"
+        group_key = "_drug_group"
     else:
-        try:
-            if getattr(response, "candidates", None):
-                cand = response.candidates[0]
-                parts = getattr(cand, "content", None)
-                if parts and getattr(parts, "parts", None):
-                    resp_text = "".join([p.text for p in parts.parts if getattr(p, "text", None)])
+        group_key = drug_col
+
+    rows = []
+    for name, group in df.groupby(group_key):
+        rec = {"drug": name}
+
+        # mean helper
+        def mean_or_none(colname):
+            if colname is None or colname not in group.columns:
+                return None
+            vals = pd.to_numeric(group[colname], errors="coerce").dropna()
+            return float(vals.mean()) if len(vals)>0 else None
+
+        mean_w = mean_or_none(wcol)
+        mean_a1c = mean_or_none(a1ccol)
+        mean_alt = mean_or_none(alt_num_col)
+
+        # compute endpoint scores
+        w_score = score_weight_mean(mean_w)
+        a1c_score = score_a1c_mean(mean_a1c)
+
+        # ALT: numeric preferred, else flag mapping
+        if mean_alt is not None:
+            alt_score = score_alt_mean_percent(mean_alt)
+        else:
+            # fallback to categorical flag if present
+            if alt_flag_col is not None and alt_flag_col in group.columns:
+                # mode of flag
+                flags = group[alt_flag_col].astype(str).fillna("").str.strip().str.lower()
+                flags = [f for f in flags if f != ""]
+                if flags:
+                    ctr = Counter(flags)
+                    # if tie -> unclear -> score 2
+                    most = ctr.most_common()
+                    if len(most) > 1 and most[0][1] == most[1][1]:
+                        alt_score = 2
+                    else:
+                        topf = most[0][0]
+                        alt_score = score_alt_flag(topf)
                 else:
-                    resp_text = str(response)
+                    alt_score = 1
             else:
-                resp_text = str(response)
-        except Exception:
-            resp_text = str(response)
+                alt_score = 1
 
-    st.subheader("Raw model output")
-    st.code(resp_text)
+        # MASH score using priority rules
+        mash_score_val, mash_meta = mash_score_from_group(group)
 
-    parsed = extract_json(resp_text)
-    if parsed is None:
-        st.error("Could not parse JSON from model response. Inspect the raw output above.")
-        st.stop()
+        total = int(w_score + a1c_score + mash_score_val + alt_score)
+        rec.update({
+            "mean_weight_loss_pct": round(mean_w,3) if mean_w is not None else None,
+            "mean_a1c_reduction_pct": round(mean_a1c,3) if mean_a1c is not None else None,
+            "mean_alt_reduction_pct": round(mean_alt,3) if mean_alt is not None else None,
+            "mean_mash_resolution_pct": round(mean_or_none(mash_res_pct_col),3) if mean_or_none(mash_res_pct_col) is not None else None,
+            "mean_mash_fibrosis_worsening_pct": round(mean_or_none(mash_fib_worse_col),3) if mean_or_none(mash_fib_worse_col) is not None else None,
+            "mean_mash_no_worse_pct": round(mean_or_none(mash_no_worse_col),3) if mean_or_none(mash_no_worse_col) is not None else None,
+            "weight_score": int(w_score),
+            "a1c_score": int(a1c_score),
+            "mash_score": int(mash_score_val),
+            "alt_score": int(alt_score),
+            "total_score": total,
+            "max_score": 20,
+            "mash_score_meta": json.dumps(mash_meta)
+        })
+        rows.append(rec)
 
-    expected_keys = [
-        "average_weight_loss_pct",
-        "average_a1c_reduction_pct",
-        "mash_resolution_counts",
-        "alt_reduction_counts",
-        "notes",
-    ]
-    missing = [k for k in expected_keys if k not in parsed]
-    if missing:
-        st.warning(f"Model returned JSON but missing expected keys: {missing} — displaying what was returned.")
+    outdf = pd.DataFrame(rows).sort_values("total_score", ascending=False).reset_index(drop=True)
+    st.markdown("### Overall scores per drug")
+    st.dataframe(outdf)
 
-    st.subheader("Parsed JSON (dataset-level outcomes)")
-    st.json(parsed)
+    st.markdown("### Top drug(s)")
+    st.table(outdf.head(10)[["drug","total_score","weight_score","a1c_score","mash_score","alt_score"]])
 
-    # Download button
-    out_bytes = json.dumps(parsed, indent=2).encode("utf-8")
-    st.download_button(label="Download outcomes JSON", data=out_bytes, file_name=OUTPUT_JSON, mime="application/json")
+    st.download_button("Download overall scores CSV", data=outdf.to_csv(index=False).encode("utf-8"), file_name="overall_scores_by_drug.csv", mime="text/csv")
+    st.download_button("Download overall scores JSON", data=json.dumps(rows, indent=2).encode("utf-8"), file_name="overall_scores_by_drug.json", mime="application/json")
 
-    st.success("Analysis complete.")
+    st.success("Done — scoring applied with your exact thresholds.")

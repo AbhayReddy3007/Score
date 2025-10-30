@@ -143,7 +143,7 @@ def score_a1c_reduction(pct: Optional[float]) -> int:
 # Streamlit UI and main flow
 # ----------------------------
 st.set_page_config(page_title="Dataset-level Outcome Extractor", layout="wide")
-st.title("Dataset-level Outcome Extractor — Gemini 2.5-flash (no ALT endpoint)")
+st.title("Dataset-level Outcome Extractor — Gemini 2.5-flash (  )")
 st.write(
     "Upload a CSV with a column named `abstract` (case-insensitive). "
     "The app will ask Gemini to read all abstracts and return dataset-level "

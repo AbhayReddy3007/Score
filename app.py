@@ -251,7 +251,7 @@ if genai is None:
     st.stop()
 
 # Option: include ALT in total score
-include_alt_in_total = st.checkbox("Include ALT endpoint in total points (adds up to +5)", value=True)
+include_alt_in_total = True
 
 # Button to analyze dataset
 if st.button("Analyze dataset"):

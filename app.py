@@ -1,22 +1,4 @@
-# app.py
-"""
-Streamlit app — dataset-level extractor using Gemini 2.5-flash.
 
-This version asks Gemini to read all abstracts and return a single dataset-level
-average ALT %-reduction (average_alt_reduction_pct). That value is used to compute
-the ALT endpoint score according to your bins.
-
-Instructions:
-- Put your Gemini API key in Streamlit secrets (.streamlit/secrets.toml):
-    GEMINI_API_KEY = "your_real_gemini_api_key_here"
-  Or export GEMINI_API_KEY as an environment variable (fallback).
-
-- Install dependencies:
-    pip install streamlit pandas google-genai
-
-- Run:
-    streamlit run app.py
-"""
 import os
 import json
 from typing import Optional, Any
@@ -34,18 +16,16 @@ except Exception:
 MODEL_NAME = "gemini-2.5-flash"
 OUTPUT_JSON = "overall_outcomes.json"
 
-# Prompt: request dataset-level average ALT %-reduction (single number)
+# Prompt: request dataset-level averages for weight loss and A1c only (no ALT)
 DATASET_PROMPT_TEMPLATE = (
     "You are an extractor for clinical research abstracts. I will provide a numbered list of "
     "abstracts from multiple studies.\n\n"
     "Read all abstracts and return exactly one JSON object (single-line) with the following keys:\n\n"
     "1) average_weight_loss_pct -> numeric mean of reported weight-loss percentages across abstracts that report it (null if none).\n\n"
     "2) average_a1c_reduction_pct -> numeric mean of reported A1c absolute reductions (percentage points) across abstracts that report it (null if none).\n\n"
-    "3) average_alt_reduction_pct -> numeric mean of reported ALT %-reduction from baseline across abstracts that report it. Return null if no abstracts report ALT %-reduction. Use a single numeric value (prefer a best estimate/midpoint for ranges).\n\n"
-    "4) mash_resolution_counts -> object with integer counts of abstracts that reported MASH/NASH resolution as yes/no/unclear.\n\n"
-    "5) alt_reduction_counts -> object with integer counts of abstracts reporting ALT reduction/normalization as yes/no/unclear.\n\n"
-    "6) notes -> a short one-sentence caveat if needed; otherwise an empty string.\n\n"
-    "IMPORTANT: Return only the single JSON object and nothing else.\n\n"
+    "3) mash_resolution_counts -> object with integer counts of abstracts that reported MASH/NASH resolution as yes/no/unclear.\n\n"
+    "4) notes -> a short one-sentence caveat if needed; otherwise an empty string.\n\n"
+    "IMPORTANT: Do NOT include any ALT-related fields. Return only the single JSON object and nothing else.\n\n"
     "Now analyze these abstracts (they are numbered to match your output if needed):\n\n"
     "-----\n"
     "{all_abstracts}\n"
@@ -159,39 +139,15 @@ def score_a1c_reduction(pct: Optional[float]) -> int:
     return 1
 
 
-# --- ALT scoring (dataset-level average) ---
-def score_alt_avg_pct(avg_pct: Optional[float]) -> int:
-    """
-    ALT reduction scoring by percent reduction from baseline:
-      5: >50% reduction
-      4: >30 - 50%
-      3: >15 - 29%
-      2: >0 - 15%
-      1: <= 0 (no reduction or increase)
-    If avg_pct is None -> return 0
-    """
-    if avg_pct is None:
-        return 0
-    if avg_pct > 50:
-        return 5
-    if avg_pct > 30:
-        return 4
-    if avg_pct > 15:
-        return 3
-    if avg_pct > 0:
-        return 2
-    return 1
-
-
 # ----------------------------
 # Streamlit UI and main flow
 # ----------------------------
 st.set_page_config(page_title="Dataset-level Outcome Extractor", layout="wide")
-st.title("Dataset-level Outcome Extractor — Gemini 2.5-flash (dataset-level ALT)")
+st.title("Dataset-level Outcome Extractor — Gemini 2.5-flash (no ALT endpoint)")
 st.write(
     "Upload a CSV with a column named `abstract` (case-insensitive). "
-    "The app will ask Gemini to read all abstracts and return one dataset-level "
-    "average ALT %-reduction used to compute the ALT score."
+    "The app will ask Gemini to read all abstracts and return dataset-level "
+    "averages for weight loss and A1c only."
 )
 
 uploaded_file = st.file_uploader("Upload CSV file with abstracts", type=["csv"])
@@ -250,9 +206,6 @@ if genai is None:
     st.error("Missing dependency: google-genai. Install with `pip install google-genai`.")
     st.stop()
 
-# Option: include ALT in total score
-include_alt_in_total = True
-
 # Button to analyze dataset
 if st.button("Analyze dataset"):
     client = genai.Client(api_key=api_key)
@@ -295,7 +248,7 @@ if st.button("Analyze dataset"):
     st.json(parsed)
 
     # ------------------------
-    # Compute scores
+    # Compute scores (weight + A1c only)
     # ------------------------
     avg_wt = safe_to_float(parsed.get("average_weight_loss_pct"))
     weight_points = score_weight_loss(avg_wt)
@@ -303,31 +256,20 @@ if st.button("Analyze dataset"):
     avg_a1c = safe_to_float(parsed.get("average_a1c_reduction_pct"))
     a1c_points = score_a1c_reduction(avg_a1c)
 
-    # ALT: use average_alt_reduction_pct returned by model (single number)
-    avg_alt = safe_to_float(parsed.get("average_alt_reduction_pct"))
-    alt_points = score_alt_avg_pct(avg_alt)
-    alt_method = "model_average_alt_reduction_pct" if avg_alt is not None else "no_model_alt_average"
-
     # Build output JSON with scores
     parsed_with_scores = dict(parsed)  # shallow copy
     parsed_with_scores.update(
         {
             "average_weight_loss_pct_normalized": avg_wt,
             "average_a1c_reduction_pct_normalized": avg_a1c,
-            "average_alt_reduction_pct_normalized": avg_alt,
             "weight_score_points": weight_points,
             "a1c_score_points": a1c_points,
-            "alt_score_points": alt_points,
-            "alt_detection_method": alt_method,
         }
     )
 
-    # Total points: weight (5) + a1c (5) and optionally ALT (+5)
+    # Total points: weight (5) + a1c (5) = 10 max
     total_points = weight_points + a1c_points
     max_points = 10
-    if include_alt_in_total:
-        total_points += alt_points
-        max_points += 5
 
     parsed_with_scores.update({"total_points": total_points, "max_points": max_points})
 
@@ -339,7 +281,6 @@ if st.button("Analyze dataset"):
     st.markdown(
         f"- Weight-loss average (model): **{avg_wt if avg_wt is not None else 'N/A'}**  → points: **{weight_points} / 5**\n"
         f"- A1c reduction average (model): **{avg_a1c if avg_a1c is not None else 'N/A'}**  → points: **{a1c_points} / 5**\n"
-        f"- ALT average (model): **{avg_alt if avg_alt is not None else 'N/A'}**  → points: **{alt_points} / 5**\n"
         f"- **Total points: {total_points} / {max_points}**"
     )
 

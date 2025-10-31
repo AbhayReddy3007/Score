@@ -1,4 +1,29 @@
+# app.py
+"""
+Streamlit app — dataset-level extractor using Gemini 2.5-flash.
 
+This version implements MASH resolution logic:
+- The model is asked to find the highest reported % of patients with MASH resolution
+  across all abstracts and whether any abstracts report worsening of fibrosis.
+- Scoring for MASH follows the user's rules:
+    5: >=50% resolution with no worsening of fibrosis
+    4: >=30% resolution with no worsening of fibrosis
+    3: resolution reported but some worsening of fibrosis
+    2: mixed or ambiguous data on resolution
+    1: No resolution
+- The app still extracts dataset-level weight-loss and A1c averages and scores them.
+
+Instructions:
+- Put your Gemini API key in Streamlit secrets (.streamlit/secrets.toml):
+    GEMINI_API_KEY = "your_real_gemini_api_key_here"
+  Or export GEMINI_API_KEY as an environment variable (fallback).
+
+- Install dependencies:
+    pip install streamlit pandas google-genai
+
+- Run:
+    streamlit run app.py
+"""
 import os
 import json
 from typing import Optional, Any
@@ -16,16 +41,20 @@ except Exception:
 MODEL_NAME = "gemini-2.5-flash"
 OUTPUT_JSON = "overall_outcomes.json"
 
-# Prompt: request dataset-level averages for weight loss and A1c only (no ALT)
+# Prompt: request dataset-level averages for weight/A1c and MASH highest resolution + fibrosis worsening
 DATASET_PROMPT_TEMPLATE = (
     "You are an extractor for clinical research abstracts. I will provide a numbered list of "
     "abstracts from multiple studies.\n\n"
     "Read all abstracts and return exactly one JSON object (single-line) with the following keys:\n\n"
     "1) average_weight_loss_pct -> numeric mean of reported weight-loss percentages across abstracts that report it (null if none).\n\n"
     "2) average_a1c_reduction_pct -> numeric mean of reported A1c absolute reductions (percentage points) across abstracts that report it (null if none).\n\n"
-    "3) mash_resolution_counts -> object with integer counts of abstracts that reported MASH/NASH resolution as yes/no/unclear.\n\n"
-    "4) notes -> a short one-sentence caveat if needed; otherwise an empty string.\n\n"
-    "IMPORTANT: Do NOT include any ALT-related fields. Return only the single JSON object and nothing else.\n\n"
+    "3) mash_highest_resolution_pct -> a single numeric value equal to the HIGHEST percentage of patients reported in any study to have MASH resolution (percent from baseline). "
+    "If no studies report a percent, return null. If a study reports a range (e.g., 20-30%), provide your best single-number estimate (prefer midpoint) and document in 'mash_notes'.\n\n"
+    "4) mash_worsening_of_fibrosis -> one of the strings 'yes', 'no', or 'unclear' indicating whether any abstracts reported worsening of fibrosis in patients (choose 'yes' if any worsening is reported, 'no' if none report worsening, 'unclear' if ambiguous).\n\n"
+    "5) mash_notes -> a short one-sentence caveat describing how you interpreted resolution percentages and fibrosis worsening (e.g., 'one study reported 60% resolution but also mentioned fibrosis progression in 5%').\n\n"
+    "6) mash_resolution_counts -> optional object with integer counts (yes/no/unclear) for resolution if you provide them.\n\n"
+    "7) notes -> a short one-sentence caveat for other endpoints if needed; otherwise an empty string.\n\n"
+    "IMPORTANT: Return only the single JSON object and nothing else.\n\n"
     "Now analyze these abstracts (they are numbered to match your output if needed):\n\n"
     "-----\n"
     "{all_abstracts}\n"
@@ -91,6 +120,27 @@ def safe_to_float(val: Any) -> Optional[float]:
     return None
 
 
+def normalize_yes_no_unclear(val: Any) -> Optional[str]:
+    """Normalize model-provided fibrosis worsening strings to 'yes'/'no'/'unclear' or None."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return "yes" if val else "no"
+    s = str(val).strip().lower()
+    if s in {"yes", "y", "true", "t"}:
+        return "yes"
+    if s in {"no", "n", "false", "f"}:
+        return "no"
+    if s in {"unclear", "unknown", "maybe", "ambiguous", "unsure"}:
+        return "unclear"
+    # sometimes models return longer phrases
+    if "worsen" in s or "progress" in s or "fibrosis increased" in s or "fibrosis progression" in s:
+        return "yes"
+    if "no worsen" in s or "no progression" in s or "no fibrosis worsening" in s or "no progression noted" in s:
+        return "no"
+    # default to 'unclear' if unsure
+    return "unclear"
+
 # --- Weight loss scoring ---
 def score_weight_loss(pct: Optional[float]) -> int:
     """
@@ -139,10 +189,65 @@ def score_a1c_reduction(pct: Optional[float]) -> int:
     return 1
 
 
+# --- MASH scoring according to the user's rules ---
+def score_mash(highest_pct: Optional[float], fibrosis_status: Optional[str], ambiguous_flag: Optional[bool]) -> int:
+    """
+    Scoring rules (user-specified):
+      5: >=50% resolution with no worsening of fibrosis
+      4: >=30% resolution with no worsening of fibrosis
+      3: resolution reported but some worsening of fibrosis
+      2: mixed or ambiguous data on resolution
+      1: No resolution
+
+    Logic implemented:
+      - If ambiguous_flag is True -> 2
+      - If highest_pct is None or highest_pct == 0 -> 1
+      - If fibrosis_status == 'no' and highest_pct >= 50 -> 5
+      - If fibrosis_status == 'no' and highest_pct >= 30 -> 4
+      - If highest_pct and fibrosis_status == 'yes' -> 3
+      - If highest_pct and fibrosis_status == 'unclear' -> 2
+      - Otherwise fallback to 2 if conflicting info, else 1
+    """
+    # ambiguous marker (model explicitly says 'mixed' or 'ambiguous')
+    if ambiguous_flag:
+        return 2
+
+    # normalize
+    pct = safe_to_float(highest_pct)
+    fib = normalize_yes_no_unclear(fibrosis_status)
+
+    if pct is None or (isinstance(pct, float) and pct == 0.0):
+        # nothing reported as resolution
+        return 1
+
+    # pct is numeric and >0
+    if fib == "no":
+        if pct >= 50:
+            return 5
+        if pct >= 30:
+            return 4
+        # pct <30 but fibrosis explicitly not worsened -> treat as ambiguous/mixed (2)
+        return 2
+    elif fib == "yes":
+        # resolution reported but fibrosis worsened in some patients
+        return 3
+    elif fib == "unclear" or fib is None:
+        return 2
+
+    # fallback
+    return 2
+
 # ----------------------------
 # Streamlit UI and main flow
 # ----------------------------
-
+st.set_page_config(page_title="Dataset-level Outcome Extractor", layout="wide")
+st.title("Dataset-level Outcome Extractor — Gemini 2.5-flash (MASH resolution scoring)")
+st.write(
+    "Upload a CSV with a column named `abstract` (case-insensitive). "
+    "The app will ask Gemini to read all abstracts and return dataset-level "
+    "averages for weight and A1c, and MASH highest-resolution + fibrosis-worsening "
+    "info used to compute a MASH score."
+)
 
 uploaded_file = st.file_uploader("Upload CSV file with abstracts", type=["csv"])
 if not uploaded_file:
@@ -242,7 +347,7 @@ if st.button("Analyze dataset"):
     st.json(parsed)
 
     # ------------------------
-    # Compute scores (weight + A1c only)
+    # Compute scores (weight, A1c, MASH)
     # ------------------------
     avg_wt = safe_to_float(parsed.get("average_weight_loss_pct"))
     weight_points = score_weight_loss(avg_wt)
@@ -250,7 +355,53 @@ if st.button("Analyze dataset"):
     avg_a1c = safe_to_float(parsed.get("average_a1c_reduction_pct"))
     a1c_points = score_a1c_reduction(avg_a1c)
 
-    # Build output JSON with scores
+    # MASH fields
+    # Model should return 'mash_highest_resolution_pct' (numeric), 'mash_worsening_of_fibrosis' (yes/no/unclear),
+    # optionally 'mash_ambiguous' (True/False) or we infer ambiguity from notes.
+    mash_highest_pct = parsed.get("mash_highest_resolution_pct")
+    mash_worsening_raw = parsed.get("mash_worsening_of_fibrosis")
+    mash_notes = parsed.get("mash_notes") if parsed.get("mash_notes") is not None else parsed.get("notes")
+
+    # Some models may use different keys; try to detect alternates
+    if mash_highest_pct is None:
+        # try other possible key names
+        for k in parsed.keys():
+            kl = k.lower()
+            if "highest" in kl and "mash" in kl and "pct" in kl:
+                mash_highest_pct = parsed.get(k)
+                break
+            if "resolution" in kl and "pct" in kl and "mash" in kl:
+                mash_highest_pct = parsed.get(k)
+                break
+
+    if mash_worsening_raw is None:
+        for k in parsed.keys():
+            kl = k.lower()
+            if "worsen" in kl or "fibrosis" in kl:
+                mash_worsening_raw = parsed.get(k)
+                break
+
+    # ambiguous detection: if model explicitly returned a field 'mash_ambiguous' or 'mash_mixed' or notes contain 'mixed'/'ambiguous'
+    mash_ambiguous_flag = False
+    if isinstance(parsed.get("mash_ambiguous"), bool):
+        mash_ambiguous_flag = parsed.get("mash_ambiguous")
+    elif isinstance(parsed.get("mash_mixed"), bool):
+        mash_ambiguous_flag = parsed.get("mash_mixed")
+    else:
+        # look for keywords in notes
+        note_text = ""
+        if mash_notes:
+            note_text = str(mash_notes).lower()
+        if "mixed" in note_text or "ambiguous" in note_text or "conflicting" in note_text:
+            mash_ambiguous_flag = True
+
+    # normalize highest pct to float if possible
+    mash_highest_pct_norm = safe_to_float(mash_highest_pct)
+    mash_worsening_norm = normalize_yes_no_unclear(mash_worsening_raw)
+
+    mash_points = score_mash(mash_highest_pct_norm, mash_worsening_norm, mash_ambiguous_flag)
+
+    # Build output JSON with scores and mash diagnostics
     parsed_with_scores = dict(parsed)  # shallow copy
     parsed_with_scores.update(
         {
@@ -258,16 +409,21 @@ if st.button("Analyze dataset"):
             "average_a1c_reduction_pct_normalized": avg_a1c,
             "weight_score_points": weight_points,
             "a1c_score_points": a1c_points,
+            "mash_highest_resolution_pct_normalized": mash_highest_pct_norm,
+            "mash_worsening_of_fibrosis_normalized": mash_worsening_norm,
+            "mash_ambiguous_flag": mash_ambiguous_flag,
+            "mash_notes_normalized": mash_notes,
+            "mash_score_points": mash_points,
         }
     )
 
-    # Total points: weight (5) + a1c (5) = 10 max
+    # Totals: by default weight + a1c = 10 (unchanged)
     total_points = weight_points + a1c_points
     max_points = 10
 
     parsed_with_scores.update({"total_points": total_points, "max_points": max_points})
 
-    st.subheader("Parsed JSON (dataset-level outcomes + scores)")
+    st.subheader("Parsed JSON (dataset-level outcomes + scores + MASH diagnostics)")
     st.json(parsed_with_scores)
 
     # Scoring summary display
@@ -275,7 +431,11 @@ if st.button("Analyze dataset"):
     st.markdown(
         f"- Weight-loss average (model): **{avg_wt if avg_wt is not None else 'N/A'}**  → points: **{weight_points} / 5**\n"
         f"- A1c reduction average (model): **{avg_a1c if avg_a1c is not None else 'N/A'}**  → points: **{a1c_points} / 5**\n"
-        f"- **Total points: {total_points} / {max_points}**"
+        f"- MASH highest resolution (model): **{mash_highest_pct_norm if mash_highest_pct_norm is not None else 'N/A'}**\n"
+        f"- MASH fibrosis worsening (model): **{mash_worsening_norm if mash_worsening_norm is not None else 'N/A'}**\n"
+        f"- MASH ambiguous flag: **{mash_ambiguous_flag}**\n"
+        f"- MASH score: **{mash_points} / 5**\n"
+        f"- **Total points (weight + A1c): {total_points} / {max_points}**"
     )
 
     # Download button (includes scores)

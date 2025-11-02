@@ -1,27 +1,11 @@
 # app.py
 """
-Batch per-drug extractor — Gemini 2.5-flash
+Batch per-drug extractor — Gemini 2.5-flash (hardcoded API key)
 
-What it does (per unique drug):
-- Reads all abstracts for that drug (from your file), sends one prompt to Gemini,
-- Extracts these four dataset-level values:
-    1) average_weight_loss_pct
-    2) average_a1c_reduction_pct
-    3) mash_highest_resolution_pct
-    4) alt_highest_reduction_pct
-- Computes scores for each using your bins.
-- Outputs a table + downloadable CSV/JSON with ONLY those values and scores.
+Replace the value of HARD_CODED_GEMINI_API_KEY below with your real Gemini API key.
 
-Setup:
-1) Set your API key in the same terminal session:
-   CMD:    set GEMINI_API_KEY=your_real_key
-   PS:     $env:GEMINI_API_KEY="your_real_key"
-
-2) Install deps:
-   pip install streamlit pandas openpyxl google-genai
-
-Run:
-   streamlit run app.py
+Warning: hardcoding secrets is convenient for local testing but insecure for
+shared code or version control. Remove the key before committing.
 """
 import os
 import json
@@ -39,6 +23,11 @@ except Exception:
 MODEL_NAME = "gemini-2.5-flash"
 OUTPUT_JSON = "batch_outcomes.json"
 OUTPUT_CSV = "batch_outcomes.csv"
+
+# ---------- HARD-CODED API KEY ----------
+# Replace this string with your actual key:
+HARD_CODED_GEMINI_API_KEY = "YOUR_HARDCODED_GEMINI_KEY_HERE"
+# ----------------------------------------
 
 # Prompt template per drug
 DATASET_PROMPT_TEMPLATE = (
@@ -153,14 +142,6 @@ def score_a1c_reduction(pct: Optional[float]) -> int:
     return 1
 
 def score_mash(highest_pct: Optional[float], fibrosis_status: Optional[str]) -> int:
-    """
-    MASH scoring:
-      5: >=50% resolution with no worsening of fibrosis
-      4: >=30% resolution with no worsening of fibrosis
-      3: resolution with some worsening of fibrosis
-      2: mixed or ambiguous data on resolution (or fibrosis info missing)
-      1: No resolution
-    """
     pct = safe_to_float(highest_pct)
     fib = normalize_yes_no_unclear(fibrosis_status) if fibrosis_status is not None else None
     if pct is None or (isinstance(pct, float) and pct == 0.0):
@@ -178,14 +159,6 @@ def score_mash(highest_pct: Optional[float], fibrosis_status: Optional[str]) -> 
     return 2
 
 def score_alt(highest_pct: Optional[float]) -> int:
-    """
-    ALT scoring (highest reported ALT %-reduction across abstracts):
-      5: >50% reduction from baseline
-      4: 30 - 50% reduction from baseline
-      3: 15 - 29% reduction from baseline
-      2: <15% reduction from baseline (but >0)
-      1: No reduction from baseline (<=0 or none reported)
-    """
     pct = safe_to_float(highest_pct)
     if pct is None or (isinstance(pct, float) and pct <= 0.0):
         return 1
@@ -245,11 +218,12 @@ if abstract_col is None:
 
 st.success(f"Found drug column '{drug_col}' and abstract column '{abstract_col}' — {len(df)} rows.")
 
-# API key and dependency checks
-api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    st.error("GEMINI_API_KEY is not set. In CMD run:  set GEMINI_API_KEY=your_real_key  then restart this app.")
+# Use hard-coded API key
+api_key = HARD_CODED_GEMINI_API_KEY
+if not api_key or api_key == "YOUR_HARDCODED_GEMINI_KEY_HERE":
+    st.error("Hard-coded Gemini API key not set. Edit app.py and replace HARD_CODED_GEMINI_API_KEY with your key.")
     st.stop()
+
 if genai is None:
     st.error("Missing dependency: google-genai. Install with:  pip install google-genai")
     st.stop()
@@ -285,6 +259,8 @@ if st.button("Run batch extraction for ALL drugs"):
                 "mash_score_points": None,
                 "alt_highest_reduction_pct_normalized": None,
                 "alt_score_points": None,
+                "total_points": None,
+                "max_points": 20
             })
             progress.progress(int(i / n * 100))
             continue
@@ -309,7 +285,7 @@ if st.button("Run batch extraction for ALL drugs"):
 
         parsed = extract_json(resp_text)
 
-        # Small helper to find alt keys if names differ
+        # Small helper to find keys if names differ
         def get_first_key_like(d: dict, substrings: List[str]):
             for k in d.keys():
                 kl = k.lower()
@@ -342,6 +318,13 @@ if st.button("Run batch extraction for ALL drugs"):
         mash_points = score_mash(mash_highest, mash_fibrosis_raw)
         alt_points = score_alt(alt_highest)
 
+        total_points = None
+        try:
+            # sum scores (each endpoint max 5) -> total max 20
+            total_points = int(weight_points) + int(a1c_points) + int(mash_points) + int(alt_points)
+        except Exception:
+            total_points = None
+
         rows.append({
             "drug": drug,
             "average_weight_loss_pct_normalized": avg_wt,
@@ -352,6 +335,8 @@ if st.button("Run batch extraction for ALL drugs"):
             "mash_score_points": mash_points,
             "alt_highest_reduction_pct_normalized": safe_to_float(alt_highest),
             "alt_score_points": alt_points,
+            "total_points": total_points,
+            "max_points": 20
         })
 
         progress.progress(int(i / n * 100))

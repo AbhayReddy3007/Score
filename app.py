@@ -3,16 +3,17 @@
 Streamlit app — batch dataset-level extractor per drug using Gemini 2.5-flash.
 
 Behavior:
-- Upload CSV or Excel with columns:
-    * a drug column (case-insensitive: 'drug', 'drug_name', or 'treatment')
-    * an 'abstract' column (case-insensitive)
-- The app groups rows by drug, concatenates abstracts for each drug, sends one prompt
+- Upload CSV or Excel with one abstract per row and a drug identifier column.
+- The app groups by drug, concatenates abstracts for each drug, sends one prompt
   per drug to Gemini to extract four dataset-level numbers:
     - average_weight_loss_pct
     - average_a1c_reduction_pct
     - mash_highest_resolution_pct
     - alt_highest_reduction_pct
   then computes scores for each and returns a table + downloadable CSV/JSON.
+
+IMPORTANT: This version processes ALL unique drugs found in the file (no throttling).
+Be mindful of API cost and rate limits if you have many unique drugs.
 
 Requirements:
     pip install streamlit pandas openpyxl google-genai
@@ -21,7 +22,6 @@ Run:
 """
 import os
 import json
-import time
 from typing import Optional, Any, Dict, List
 
 import streamlit as st
@@ -37,7 +37,6 @@ except Exception:
 MODEL_NAME = "gemini-2.5-flash"
 OUTPUT_JSON = "batch_outcomes.json"
 OUTPUT_CSV = "batch_outcomes.csv"
-DEFAULT_SLEEP = 0.25  # seconds between model calls (adjust if you hit rate limits)
 
 # Prompt template per drug: returns a single JSON object
 DATASET_PROMPT_TEMPLATE = (
@@ -183,11 +182,11 @@ def score_alt(highest_pct: Optional[float]) -> int:
 # ----------------------------
 # Streamlit UI
 # ----------------------------
-st.set_page_config(page_title="Batch per-drug extractor", layout="wide")
+st.set_page_config(page_title="Batch per-drug extractor (all drugs)", layout="wide")
 st.title("Batch per-drug dataset-level extractor — Gemini 2.5-flash")
 st.markdown(
     "- Upload a CSV or Excel with one abstract per row and a drug identifier column.\n"
-    "- The app will group by drug and compute the four numbers + their scores for each drug."
+    "- The app will group by drug and compute the four numbers + their scores for **all** drugs found."
 )
 
 uploaded_file = st.file_uploader("Upload CSV or Excel (xlsx)", type=["csv","xlsx","xls"])
@@ -227,10 +226,6 @@ if abstract_col is None:
 
 st.success(f"Found drug column '{drug_col}' and abstract column '{abstract_col}' — {len(df)} rows.")
 
-# parameters
-per_call_sleep = st.number_input("Seconds to sleep between model calls (per drug)", value=DEFAULT_SLEEP, min_value=0.0, step=0.05)
-max_drugs = st.number_input("Max number of unique drugs to process (0 = all)", value=0, min_value=0)
-
 # API key and dependency
 api_key = None
 try:
@@ -246,18 +241,15 @@ if genai is None:
     st.error("Missing dependency: google-genai. Install with `pip install google-genai`.")
     st.stop()
 
-# start processing
-if st.button("Run batch extraction per drug"):
+# start processing (ALL unique drugs)
+if st.button("Run batch extraction for ALL drugs"):
     client = genai.Client(api_key=api_key)
 
     # group by drug → list of abstracts per drug
     grouped = df.groupby(df[drug_col].astype(str))[abstract_col].apply(list).to_dict()
     unique_drugs = list(grouped.keys())
-    if max_drugs and max_drugs > 0:
-        unique_drugs = unique_drugs[:int(max_drugs)]
-
     n = len(unique_drugs)
-    st.write(f"Processing {n} drugs...")
+    st.write(f"Processing {n} drugs (this will make {n} model calls)...")
     progress = st.progress(0)
 
     results: List[Dict[str, Any]] = []
@@ -272,7 +264,6 @@ if st.button("Run batch extraction per drug"):
             response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
         except Exception as e:
             st.warning(f"API error for drug '{drug}': {e}")
-            # append row with NaNs and continue
             results.append({
                 "drug": drug,
                 "average_weight_loss_pct_normalized": None,
@@ -286,7 +277,6 @@ if st.button("Run batch extraction per drug"):
                 "raw_model_output": None
             })
             progress.progress(int(i/n*100))
-            time.sleep(per_call_sleep)
             continue
 
         # robustly extract text from response
@@ -323,7 +313,6 @@ if st.button("Run batch extraction per drug"):
                 "raw_model_output": resp_text
             })
             progress.progress(int(i/n*100))
-            time.sleep(per_call_sleep)
             continue
 
         # extract numeric fields (with fallback key detection)
@@ -341,7 +330,6 @@ if st.button("Run batch extraction per drug"):
 
         # optional fibrosis field (to compute MASH score correctly)
         mash_fibrosis_raw = parsed.get("mash_worsening_of_fibrosis") or get_first_key_like(parsed, ["mash","worsen","fibrosis"])
-
         mash_fibrosis_norm = normalize_yes_no_unclear(mash_fibrosis_raw) if mash_fibrosis_raw is not None else None
 
         # compute scores
@@ -364,8 +352,6 @@ if st.button("Run batch extraction per drug"):
         })
 
         progress.progress(int(i/n*100))
-        # polite sleep
-        time.sleep(per_call_sleep)
 
     # assemble results dataframe
     out_df = pd.DataFrame(results)

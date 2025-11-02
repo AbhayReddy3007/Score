@@ -1,24 +1,27 @@
 # app.py
 """
-Streamlit app — batch dataset-level extractor per drug using Gemini 2.5-flash.
+Batch per-drug extractor — Gemini 2.5-flash
 
-Behavior:
-- Upload CSV or Excel with one abstract per row and a drug identifier column.
-- The app groups by drug, concatenates abstracts for each drug, sends one prompt
-  per drug to Gemini to extract four dataset-level numbers:
-    - average_weight_loss_pct
-    - average_a1c_reduction_pct
-    - mash_highest_resolution_pct
-    - alt_highest_reduction_pct
-  then computes scores for each and returns a table + downloadable CSV/JSON.
+What it does (per unique drug):
+- Reads all abstracts for that drug (from your file), sends one prompt to Gemini,
+- Extracts these four dataset-level values:
+    1) average_weight_loss_pct
+    2) average_a1c_reduction_pct
+    3) mash_highest_resolution_pct
+    4) alt_highest_reduction_pct
+- Computes scores for each using your bins.
+- Outputs a table + downloadable CSV/JSON with ONLY those values and scores.
 
-IMPORTANT: This version processes ALL unique drugs found in the file (no throttling).
-Be mindful of API cost and rate limits if you have many unique drugs.
+Setup:
+1) Set your API key in the same terminal session:
+   CMD:    set GEMINI_API_KEY=your_real_key
+   PS:     $env:GEMINI_API_KEY="your_real_key"
 
-Requirements:
-    pip install streamlit pandas openpyxl google-genai
+2) Install deps:
+   pip install streamlit pandas openpyxl google-genai
+
 Run:
-    streamlit run app.py
+   streamlit run app.py
 """
 import os
 import json
@@ -27,18 +30,17 @@ from typing import Optional, Any, Dict, List
 import streamlit as st
 import pandas as pd
 
-# lazy import genai to give helpful error if missing
+# Lazy import for better error if missing
 try:
     from google import genai
 except Exception:
     genai = None
 
-# CONFIG
 MODEL_NAME = "gemini-2.5-flash"
 OUTPUT_JSON = "batch_outcomes.json"
 OUTPUT_CSV = "batch_outcomes.csv"
 
-# Prompt template per drug: returns a single JSON object
+# Prompt template per drug
 DATASET_PROMPT_TEMPLATE = (
     "You are an extractor for clinical research abstracts. I will provide a numbered list of "
     "abstracts from multiple studies for a single drug.\n\n"
@@ -47,7 +49,9 @@ DATASET_PROMPT_TEMPLATE = (
     "2) average_a1c_reduction_pct -> numeric mean of reported A1c absolute reductions (percentage points) across abstracts that report it (null if none).\n\n"
     "3) mash_highest_resolution_pct -> the HIGHEST percentage of patients reported in any study to have MASH resolution (percent from baseline). Return null if none reported.\n\n"
     "4) alt_highest_reduction_pct -> the HIGHEST percentage reduction in ALT from baseline reported in any abstract (percent). Return null if none reported.\n\n"
-    "IMPORTANT: Return ONLY the single JSON object and NOTHING else. Do not include commentary.\n\n"
+    "Optionally (only if easy to extract):\n"
+    " - mash_worsening_of_fibrosis -> 'yes'/'no'/'unclear' if any abstracts reported worsening of fibrosis.\n\n"
+    "IMPORTANT: Return ONLY the single JSON object and NOTHING else.\n\n"
     "Now analyze these abstracts:\n\n"
     "-----\n"
     "{all_abstracts}\n"
@@ -121,7 +125,7 @@ def normalize_yes_no_unclear(val: Any) -> Optional[str]:
         return "no"
     return "unclear"
 
-# scoring functions (identical to your rules)
+# ---- Scoring (your bins) ----
 def score_weight_loss(pct: Optional[float]) -> int:
     if pct is None:
         return 0
@@ -149,9 +153,17 @@ def score_a1c_reduction(pct: Optional[float]) -> int:
     return 1
 
 def score_mash(highest_pct: Optional[float], fibrosis_status: Optional[str]) -> int:
+    """
+    MASH scoring:
+      5: >=50% resolution with no worsening of fibrosis
+      4: >=30% resolution with no worsening of fibrosis
+      3: resolution with some worsening of fibrosis
+      2: mixed or ambiguous data on resolution (or fibrosis info missing)
+      1: No resolution
+    """
     pct = safe_to_float(highest_pct)
     fib = normalize_yes_no_unclear(fibrosis_status) if fibrosis_status is not None else None
-    if pct is None or (isinstance(pct,float) and pct == 0.0):
+    if pct is None or (isinstance(pct, float) and pct == 0.0):
         return 1
     if fib is None or fib == "unclear":
         return 2
@@ -166,8 +178,16 @@ def score_mash(highest_pct: Optional[float], fibrosis_status: Optional[str]) -> 
     return 2
 
 def score_alt(highest_pct: Optional[float]) -> int:
+    """
+    ALT scoring (highest reported ALT %-reduction across abstracts):
+      5: >50% reduction from baseline
+      4: 30 - 50% reduction from baseline
+      3: 15 - 29% reduction from baseline
+      2: <15% reduction from baseline (but >0)
+      1: No reduction from baseline (<=0 or none reported)
+    """
     pct = safe_to_float(highest_pct)
-    if pct is None or (isinstance(pct,float) and pct <= 0.0):
+    if pct is None or (isinstance(pct, float) and pct <= 0.0):
         return 1
     if pct > 50:
         return 5
@@ -186,15 +206,15 @@ st.set_page_config(page_title="Batch per-drug extractor (all drugs)", layout="wi
 st.title("Batch per-drug dataset-level extractor — Gemini 2.5-flash")
 st.markdown(
     "- Upload a CSV or Excel with one abstract per row and a drug identifier column.\n"
-    "- The app will group by drug and compute the four numbers + their scores for **all** drugs found."
+    "- The app will group by drug and compute the four numbers + their scores for **all** drugs."
 )
 
-uploaded_file = st.file_uploader("Upload CSV or Excel (xlsx)", type=["csv","xlsx","xls"])
+uploaded_file = st.file_uploader("Upload CSV or Excel (xlsx/xls/csv)", type=["csv","xlsx","xls"])
 if not uploaded_file:
-    st.info("Upload a CSV or Excel file to begin. Required columns: a drug column and 'abstract'.")
+    st.info("Upload a file to begin. Required columns: a drug column and 'abstract'.")
     st.stop()
 
-# read file into DataFrame
+# Read file
 try:
     if str(uploaded_file.name).lower().endswith((".xls",".xlsx")):
         df = pd.read_excel(uploaded_file)
@@ -204,67 +224,58 @@ except Exception as e:
     st.error(f"Could not read uploaded file: {e}")
     st.stop()
 
-# find drug column
+# Find columns
 drug_col = None
 for c in df.columns:
     if c.strip().lower() in {"drug","drug_name","treatment","drugname"}:
         drug_col = c
         break
 if drug_col is None:
-    st.error("Could not find a drug column. Please include a column named 'drug' or 'drug_name' (case-insensitive).")
+    st.error("Could not find a drug column. Include a column named 'drug' or 'drug_name' (case-insensitive).")
     st.stop()
 
-# find abstract column
 abstract_col = None
 for c in df.columns:
     if c.strip().lower() == "abstract":
         abstract_col = c
         break
 if abstract_col is None:
-    st.error("CSV/Excel must contain an 'abstract' column (case-insensitive).")
+    st.error("File must contain an 'abstract' column (case-insensitive).")
     st.stop()
 
 st.success(f"Found drug column '{drug_col}' and abstract column '{abstract_col}' — {len(df)} rows.")
 
-# API key and dependency
-api_key = None
-try:
-    api_key = st.secrets.get("GEMINI_API_KEY") if hasattr(st, "secrets") else None
-except Exception:
-    api_key = None
+# API key and dependency checks
+api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
-    api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    st.error("No Gemini API key found. Set GEMINI_API_KEY in Streamlit secrets or environment variables.")
+    st.error("GEMINI_API_KEY is not set. In CMD run:  set GEMINI_API_KEY=your_real_key  then restart this app.")
     st.stop()
 if genai is None:
-    st.error("Missing dependency: google-genai. Install with `pip install google-genai`.")
+    st.error("Missing dependency: google-genai. Install with:  pip install google-genai")
     st.stop()
 
-# start processing (ALL unique drugs)
+# Run processing
 if st.button("Run batch extraction for ALL drugs"):
     client = genai.Client(api_key=api_key)
 
-    # group by drug → list of abstracts per drug
     grouped = df.groupby(df[drug_col].astype(str))[abstract_col].apply(list).to_dict()
     unique_drugs = list(grouped.keys())
     n = len(unique_drugs)
-    st.write(f"Processing {n} drugs (this will make {n} model calls)...")
+    st.write(f"Processing {n} drugs…")
     progress = st.progress(0)
 
-    results: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
     for i, drug in enumerate(unique_drugs, start=1):
         abstracts = grouped[drug]
-        # build combined numbered abstracts
-        combined = "\n\n".join([f"{idx+1}. {' '.join(str(a).split())}" for idx,a in enumerate(abstracts)])
+        combined = "\n\n".join([f"{idx+1}. {' '.join(str(a).split())}" for idx, a in enumerate(abstracts)])
         prompt = DATASET_PROMPT_TEMPLATE.replace("{all_abstracts}", combined)
 
-        # call model
+        # Call model
         try:
             response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
         except Exception as e:
             st.warning(f"API error for drug '{drug}': {e}")
-            results.append({
+            rows.append({
                 "drug": drug,
                 "average_weight_loss_pct_normalized": None,
                 "weight_score_points": None,
@@ -274,12 +285,11 @@ if st.button("Run batch extraction for ALL drugs"):
                 "mash_score_points": None,
                 "alt_highest_reduction_pct_normalized": None,
                 "alt_score_points": None,
-                "raw_model_output": None
             })
-            progress.progress(int(i/n*100))
+            progress.progress(int(i / n * 100))
             continue
 
-        # robustly extract text from response
+        # Extract text
         resp_text = ""
         if hasattr(response, "text") and response.text:
             resp_text = response.text
@@ -298,24 +308,8 @@ if st.button("Run batch extraction for ALL drugs"):
                 resp_text = str(response)
 
         parsed = extract_json(resp_text)
-        if parsed is None:
-            st.warning(f"Could not parse JSON for drug '{drug}'. Saving raw output for inspection.")
-            results.append({
-                "drug": drug,
-                "average_weight_loss_pct_normalized": None,
-                "weight_score_points": None,
-                "average_a1c_reduction_pct_normalized": None,
-                "a1c_score_points": None,
-                "mash_highest_resolution_pct_normalized": None,
-                "mash_score_points": None,
-                "alt_highest_reduction_pct_normalized": None,
-                "alt_score_points": None,
-                "raw_model_output": resp_text
-            })
-            progress.progress(int(i/n*100))
-            continue
 
-        # extract numeric fields (with fallback key detection)
+        # Small helper to find alt keys if names differ
         def get_first_key_like(d: dict, substrings: List[str]):
             for k in d.keys():
                 kl = k.lower()
@@ -323,22 +317,32 @@ if st.button("Run batch extraction for ALL drugs"):
                     return d.get(k)
             return None
 
-        avg_wt = safe_to_float(parsed.get("average_weight_loss_pct") or get_first_key_like(parsed, ["average","weight","loss","pct"]) )
-        avg_a1c = safe_to_float(parsed.get("average_a1c_reduction_pct") or get_first_key_like(parsed, ["average","a1c","reduction","pct"]) )
-        mash_highest = parsed.get("mash_highest_resolution_pct") or get_first_key_like(parsed, ["mash","highest","resolution","pct"])
-        alt_highest = parsed.get("alt_highest_reduction_pct") or get_first_key_like(parsed, ["alt","highest","reduction","pct"])
+        # Extract fields safely
+        avg_wt = None
+        avg_a1c = None
+        mash_highest = None
+        alt_highest = None
+        mash_fibrosis_raw = None
 
-        # optional fibrosis field (to compute MASH score correctly)
-        mash_fibrosis_raw = parsed.get("mash_worsening_of_fibrosis") or get_first_key_like(parsed, ["mash","worsen","fibrosis"])
-        mash_fibrosis_norm = normalize_yes_no_unclear(mash_fibrosis_raw) if mash_fibrosis_raw is not None else None
+        if isinstance(parsed, dict):
+            avg_wt = safe_to_float(parsed.get("average_weight_loss_pct") or
+                                   get_first_key_like(parsed, ["average","weight","loss","pct"]))
+            avg_a1c = safe_to_float(parsed.get("average_a1c_reduction_pct") or
+                                    get_first_key_like(parsed, ["average","a1c","reduction","pct"]))
+            mash_highest = parsed.get("mash_highest_resolution_pct") or \
+                           get_first_key_like(parsed, ["mash","highest","resolution","pct"])
+            alt_highest = parsed.get("alt_highest_reduction_pct") or \
+                          get_first_key_like(parsed, ["alt","highest","reduction","pct"])
+            mash_fibrosis_raw = parsed.get("mash_worsening_of_fibrosis") or \
+                                get_first_key_like(parsed, ["mash","worsen","fibrosis"])
 
-        # compute scores
+        # Scores
         weight_points = score_weight_loss(avg_wt)
         a1c_points = score_a1c_reduction(avg_a1c)
-        mash_points = score_mash(mash_highest, mash_fibrosis_norm)
+        mash_points = score_mash(mash_highest, mash_fibrosis_raw)
         alt_points = score_alt(alt_highest)
 
-        results.append({
+        rows.append({
             "drug": drug,
             "average_weight_loss_pct_normalized": avg_wt,
             "weight_score_points": weight_points,
@@ -348,18 +352,17 @@ if st.button("Run batch extraction for ALL drugs"):
             "mash_score_points": mash_points,
             "alt_highest_reduction_pct_normalized": safe_to_float(alt_highest),
             "alt_score_points": alt_points,
-            "raw_model_output": resp_text
         })
 
-        progress.progress(int(i/n*100))
+        progress.progress(int(i / n * 100))
 
-    # assemble results dataframe
-    out_df = pd.DataFrame(results)
+    out_df = pd.DataFrame(rows)
     st.subheader("Results (first 50 rows)")
     st.dataframe(out_df.head(50))
 
-    # download buttons
-    st.download_button("Download CSV", data=out_df.to_csv(index=False).encode("utf-8"), file_name=OUTPUT_CSV, mime="text/csv")
-    st.download_button("Download JSON", data=out_df.to_json(orient="records", indent=2).encode("utf-8"), file_name=OUTPUT_JSON, mime="application/json")
+    st.download_button("Download CSV", data=out_df.to_csv(index=False).encode("utf-8"),
+                       file_name=OUTPUT_CSV, mime="text/csv")
+    st.download_button("Download JSON", data=out_df.to_json(orient="records", indent=2).encode("utf-8"),
+                       file_name=OUTPUT_JSON, mime="application/json")
 
     st.success("Batch extraction complete.")

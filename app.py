@@ -1,16 +1,7 @@
-# app.py
-"""
-Batch per-drug extractor — Gemini 2.5-flash (hardcoded API key)
 
-This version asks Gemini to return per-study extracted values for weight loss, A1c, and MASH
-(in arrays) plus highest values. The app computes individual scores for each extracted
-value, shows those lists in the output, and assigns the endpoint points based on the
-highest individual score.
-
-Replace HARD_CODED_GEMINI_API_KEY with your real key.
-"""
 import os
 import json
+import re
 from typing import Optional, Any, Dict, List
 
 import streamlit as st
@@ -41,7 +32,7 @@ DATASET_PROMPT_TEMPLATE = (
     # A1c
     "3) a1c_reduction_values -> array of numeric absolute A1c reductions (percentage points) reported across abstracts (e.g. [1.2, 0.9, 2.3]). If none reported, return an empty array.\n\n"
     "4) highest_a1c_reduction_pct -> a single numeric value equal to the HIGHEST reported A1c absolute reduction (percentage points), or null if none.\n\n"
-    # MASH (now per-study values + per-study fibrosis flag)
+    # MASH (per-study values + per-study fibrosis flag)
     "5) mash_values -> array of numeric percentages (per study) representing the percent of patients with MASH resolution reported in each abstract (e.g. [40, 25, 60]). If none reported, return an empty array.\n\n"
     "6) mash_worsening_flags -> array of strings (per study) aligned to mash_values. Each element should be one of 'yes', 'no', or 'unclear' indicating whether that study reported worsening of fibrosis. If a study did not mention fibrosis worsening, use 'unclear'. If no mash_values, return an empty array for this too.\n\n"
     "7) mash_highest_resolution_pct -> the HIGHEST percentage of patients reported to have MASH resolution in any study, or null if none.\n\n"
@@ -189,6 +180,252 @@ def score_alt(highest_pct: Optional[float]) -> int:
         return 2
     return 1
 
+# ---------- Line-of-Treatment (LOT) scoring functions ----------
+# Guiding Principle, Clinical Stage, Commercial Stage implemented per user's mapping.
+def score_guiding_principle(parsed: dict, abstracts: List[str]) -> int:
+    parsed = parsed or {}
+    abstracts = abstracts or []
+    fulltext = " ".join(abstracts).lower()
+
+    gp_parsed = None
+    if isinstance(parsed, dict):
+        for k in ["guiding_principle", "positioning", "line_of_treatment", "lot_position", "guiding"]:
+            v = parsed.get(k)
+            if isinstance(v, str) and v.strip():
+                gp_parsed = v.strip().lower()
+                break
+        if gp_parsed is None:
+            for k in parsed.keys():
+                if "guiding" in k.lower() and isinstance(parsed.get(k), (int, float, str)):
+                    gp_parsed = str(parsed.get(k)).lower()
+                    break
+
+    if gp_parsed:
+        if re.search(r'\b(undisputed|displacing|displace|standard of care|standard-of-care|first[- ]line standard|first line standard)\b', gp_parsed):
+            return 5
+        if re.search(r'\b(strong first[- ]line|first[- ]line alternative|1st[- ]line alternative|dominant second[- ]line|dominant 2l)\b', gp_parsed):
+            return 4
+        if re.search(r'\b(second[- ]line|2l|guideline recommended 1l|guideline recommended first[- ]line|sub[- ]population)\b', gp_parsed):
+            return 3
+        if re.search(r'\b(third[- ]line|3l|after failing|refractory)\b', gp_parsed):
+            return 2
+        if re.search(r'\b(salvage|niche|late[- ]line|palliative|limited mention)\b', gp_parsed):
+            return 1
+        if re.search(r'\b1l\b', gp_parsed):
+            return 4
+        if re.search(r'\b2l\b', gp_parsed):
+            return 3
+        if re.search(r'\b3l\b', gp_parsed):
+            return 2
+
+    if (re.search(r'\b(undisputed|displacing|displace|dominant standard of care|first[- ]line standard|standard of care|standard-of-care)\b', fulltext)
+        and re.search(r'\b(guideline|guidelines|recommended|recommendation|soc|top[- ]tier)\b', fulltext)):
+        return 5
+
+    if re.search(r'\b(strong first[- ]line|first[- ]line alternative|1st[- ]line alternative|dominant second[- ]line|dominant 2l|capture (a )?(significant|large) share)\b', fulltext):
+        return 4
+
+    if re.search(r'\b(second[- ]line|2l|recommended (as )?first[- ]line for|guideline (recommended|recommends).*first[- ]line|for (patients|subgroup|sub-population))\b', fulltext):
+        return 3
+
+    if re.search(r'\b(third[- ]line|3l|after (failing|failure|other options)|refractory|used only after)\b', fulltext):
+        return 2
+
+    if re.search(r'\b(salvage|niche|late[- ]line|last[- ]line|palliative|limited mention|no mention in guideline|rarely used)\b', fulltext):
+        return 1
+
+    return 1
+
+def score_clinical_stage(parsed: dict, abstracts: List[str]) -> int:
+    parsed = parsed or {}
+    abstracts = abstracts or []
+    fulltext = " ".join(abstracts).lower()
+
+    cs_parsed = None
+    if isinstance(parsed, dict):
+        for k in ["clinical_stage", "stage", "development_stage", "clinical_stage_criteria", "stage_position"]:
+            v = parsed.get(k)
+            if isinstance(v, str) and v.strip():
+                cs_parsed = v.strip().lower()
+                break
+        if cs_parsed is None:
+            for k in parsed.keys():
+                if "stage" in k.lower() and isinstance(parsed.get(k), (int, float, str)):
+                    cs_parsed = str(parsed.get(k)).lower()
+                    break
+
+    if cs_parsed:
+        if re.search(r'\b(transformative|transformative efficacy|clean safety|new standard of care|new soc|become the new soc|preferred option|expert consensus|draft guideline|preferred in guidelines)\b', cs_parsed):
+            return 5
+        if re.search(r'\b(competitive 1st|competitive 1l|competitive first[- ]line|go to 2nd|go to 2l|recommended option|included in guidelines|recommended in guidelines)\b', cs_parsed):
+            return 4
+        if re.search(r'\b(2l|second[- ]line|niche 1l|niche first[- ]line|biomarker|subgroup|guideline subsection)\b', cs_parsed):
+            return 3
+        if re.search(r'\b(3l|third[- ]line|treatment[- ]resistant|refractory|later line)\b', cs_parsed):
+            return 2
+        if re.search(r'\b(small population|highly refractory|exhausted all|very small|ultra[- ]rare)\b', cs_parsed):
+            return 1
+
+    if (re.search(r'\b(transformative|transformative efficacy|highly effective|dramatic improvement|remarkable efficacy)\b', fulltext)
+        and re.search(r'\b(clean safety|well tolerated|favorable safety|low adverse|good safety profile)\b', fulltext)
+        and re.search(r'\b(draft guideline|expert consensus|preferred option|recommended as preferred|new standard of care|new soc|standard of care)\b', fulltext)):
+        return 5
+
+    if re.search(r'\b(competitive first[- ]line|competitive 1l|competitive 1st|recommended option in guidelines|included in guidelines|recommended in guidelines|go to 2l|go to second[- ]line)\b', fulltext):
+        return 4
+
+    if re.search(r'\b(second[- ]line|2l|niche first[- ]line|niche 1l|biomarker positive|biomarker|subgroup|guideline subsection)\b', fulltext):
+        return 3
+
+    if re.search(r'\b(third[- ]line|3l|treatment[- ]resistant|refractory|after (failing|failure|other options)|heavily pretreated)\b', fulltext):
+        return 2
+
+    if re.search(r'\b(very small|highly refractory|exhausted all other|ultra[- ]rare|limited population|rare disease|salvage)\b', fulltext):
+        return 1
+
+    return 1
+
+def score_commercial_stage(parsed: dict, abstracts: List[str]) -> int:
+    parsed = parsed or {}
+    abstracts = abstracts or []
+    fulltext = " ".join(abstracts).lower()
+
+    cm_parsed = None
+    if isinstance(parsed, dict):
+        for k in ["commercial_stage", "commercial_status", "market", "market_stage", "market_share", "prescription", "most_prescribed"]:
+            v = parsed.get(k)
+            if isinstance(v, str) and v.strip():
+                cm_parsed = v.strip().lower()
+                break
+        if cm_parsed is None:
+            for k in parsed.keys():
+                if any(tok in k.lower() for tok in ["commercial", "market", "prescribe", "market_share", "most_prescribed"]):
+                    val = parsed.get(k)
+                    if isinstance(val, (int, float, str)) and str(val).strip():
+                        cm_parsed = str(val).lower()
+                        break
+
+    if cm_parsed:
+        if re.search(r'\b(preferred (first[- ]line|1l|1st[- ]line)|preferred option in guidelines|preferred in guidelines|sole (first[- ]line|1l)|sole soc|sole standard of care|most prescribed (1l|first[- ]line|1st[- ]line))\b', cm_parsed):
+            return 5
+        if re.search(r'\b(most[- ]prescribed|most prescribed|market leader|market-leading|dominant in 1l)\b', cm_parsed):
+            return 5
+        if re.search(r'\b(widely adopted|commonly used (1l|first[- ]line)|peer to (the )?soc|peer to soc|peer to standard of care|recommended as an option in guidelines)\b', cm_parsed):
+            return 4
+        if re.search(r'\b(most[- ]prescribed .*2l|most prescribed .*2l|most prescribed in 2l|dominant 2l)\b', cm_parsed):
+            return 4
+        if re.search(r'\b(established 2l|established second[- ]line|market share in 2l|recommended 1l for|recommended for (patients|segment|biomarker))\b', cm_parsed):
+            return 3
+        if re.search(r'\b(primaryly 3l|primarily third[- ]line|used after failure of 1l and 2l|used after failure)\b', cm_parsed):
+            return 2
+        if re.search(r'\b(salvage|last[- ]resort|last resort|limited use|no formal place|lacks formal place)\b', cm_parsed):
+            return 1
+
+    if (re.search(r'\b(preferred (first[- ]line|1l)|preferred in guidelines|preferred option in guidelines|recommended as preferred)\b', fulltext)
+        and re.search(r'\b(most prescribed|most[- ]prescribed|market leader|dominant in 1l|widely prescribed)\b', fulltext)):
+        return 5
+
+    if re.search(r'\b(widely adopted|commonly used (first[- ]line|1l)|peer to (the )?soc|peer to standard of care|recommended as an option in guidelines)\b', fulltext):
+        return 4
+    if re.search(r'\b(most (prescribed|used) .*2l|dominant in 2l|widely used in 2l)\b', fulltext):
+        return 4
+
+    if re.search(r'\b(established (2nd|second|2l) market share|established 2l|market share in 2l|recommended (as )?1l for|recommended for (biomarker|comorbidity|specific subgroup|segment))\b', fulltext):
+        return 3
+
+    if re.search(r'\b(third[- ]line|3l|used only after failure|after failure of 1l|after failure of 2l|after failing other options|used after 1l and 2l)\b', fulltext):
+        return 2
+
+    if re.search(r'\b(salvage|last[- ]resort|last resort|limited place|lacks formal place|no formal place|rarely used|limited use)\b', fulltext):
+        return 1
+
+    return 1
+
+def score_key_differentiator(parsed: dict, abstracts: List[str]) -> int:
+    """
+    Key Differentiator scoring (1-5) based on user rules:
+    5: De facto SOC — clear first choice; formal guideline recommendation as preferred SOC is strongest evidence.
+    4: Major player in early treatment: dominant force in 1L or 2L but less certain/smaller role than 5.
+    3: Established role but not dominant — clear place in algorithm but not market leader across broad population.
+    2: Reserved for later-line use — not mainstream, used later.
+    1: Outside mainstream guideline recommendations — limited to end-of-paradigm, physician discretion.
+
+    Defaults to 1 if nothing matched. Modify to return 0 if you prefer 'no-data'.
+    """
+    parsed = parsed or {}
+    abstracts = abstracts or []
+    fulltext = " ".join(abstracts).lower()
+
+    kd_parsed = None
+    if isinstance(parsed, dict):
+        for k in ["key_differentiator", "differentiator", "unique_feature", "moa", "mechanism", "differentiation"]:
+            v = parsed.get(k)
+            if isinstance(v, str) and v.strip():
+                kd_parsed = v.strip().lower()
+                break
+        if kd_parsed is None:
+            for k in parsed.keys():
+                if any(tok in k.lower() for tok in ["different", "differentiator", "moa", "mechanism", "unique"]):
+                    val = parsed.get(k)
+                    if isinstance(val, (int, float, str)) and str(val).strip():
+                        kd_parsed = str(val).lower()
+                        break
+
+    if kd_parsed:
+        # 5: de facto SOC / preferred SOC in guidelines
+        if re.search(r'\b(preferred (standard of care|soc|first[- ]line|1l)|preferred soc|preferred standard of care|de facto standard|de[- ]facto standard of care|de facto soc|de[- ]facto soc)\b', kd_parsed):
+            return 5
+        if re.search(r'\b(preferred in guidelines|recommended as preferred|guideline preferred)\b', kd_parsed):
+            return 5
+
+        # 4: major player in early treatment (dominant in 1L or 2L)
+        if re.search(r'\b(dominant (1l|1st|first[- ]line|2l|second[- ]line)|major player|market leader in (1l|2l)|dominant in (1l|2l))\b', kd_parsed):
+            return 4
+
+        # 3: established role but not dominant
+        if re.search(r'\b(established role|clear place in treatment|part of the treatment algorithm|used in the algorithm|not market leader)\b', kd_parsed):
+            return 3
+
+        # 2: reserved for later-line use
+        if re.search(r'\b(later[- ]line|reserved for later|used in later line|used in later lines|3l|third[- ]line|later line use)\b', kd_parsed):
+            return 2
+
+        # 1: outside mainstream
+        if re.search(r'\b(salvage|limited to end|physician discretion|off label|rarely used|no formal place|limited place)\b', kd_parsed):
+            return 1
+
+    # Evaluate abstracts text (strict -> lenient)
+
+    # 5: de facto SOC + guideline preferred mentions
+    if (re.search(r'\b(de[- ]facto standard of care|de facto standard of care|de[- ]facto soc|de facto soc|de[- ]facto standard)\b', fulltext)
+        and re.search(r'\b(preferred in guidelines|preferred option|guideline preferred|recommended as preferred)\b', fulltext)):
+        return 5
+    if re.search(r'\b(preferred (standard of care|soc|first[- ]line|1l)|preferred soc|preferred standard of care)\b', fulltext):
+        return 5
+
+    # 4: major player in early treatment (dominant 1L or 2L)
+    if re.search(r'\b(dominant (1l|1st|first[- ]line|2l|second[- ]line)|major player|market leader in (1l|2l)|dominant in (1l|2l))\b', fulltext):
+        return 4
+    if re.search(r'\b(major player|widely prescribed in early|widely prescribed in 1l|widely prescribed in 2l|market leader)\b', fulltext):
+        return 4
+
+    # 3: established role but not dominant
+    if re.search(r'\b(established role|part of the treatment algorithm|used in the treatment algorithm|has a clear place in the algorithm|not market leader)\b', fulltext):
+        return 3
+    if re.search(r'\b(recommended for a subgroup|recommended in guideline subsection|used for biomarker positive|used in specific subgroup)\b', fulltext):
+        return 3
+
+    # 2: reserved for later-line use
+    if re.search(r'\b(later[- ]line|reserved for later|used in later line|3l|third[- ]line|used after failure)\b', fulltext):
+        return 2
+
+    # 1: outside mainstream guideline recommendations
+    if re.search(r'\b(salvage|physician discretion|off[- ]label|rarely used|no formal place|limited place|limited use|end of treatment pathway)\b', fulltext):
+        return 1
+
+    # conservative default
+    return 1
+
 # ----------------------------
 # Streamlit UI
 # ----------------------------
@@ -196,7 +433,7 @@ st.set_page_config(page_title="Batch per-drug extractor (all drugs)", layout="wi
 st.title("Batch per-drug dataset-level extractor — Gemini 2.5-flash")
 st.markdown(
     "- Upload a CSV or Excel with one abstract per row and a drug identifier column.\n"
-    "- The app will group by drug and compute the four metrics + their scores for **all** drugs."
+    "- The app will group by drug and compute the metrics + scores (including LOT) for all drugs."
 )
 
 uploaded_file = st.file_uploader("Upload CSV or Excel (xlsx/xls/csv)", type=["csv", "xlsx", "xls"])
@@ -266,6 +503,7 @@ if st.button("Run batch extraction for ALL drugs"):
             response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
         except Exception as e:
             st.warning(f"API error for drug '{drug}': {e}")
+            # append row with empty/default fields (no raw_model_output)
             rows.append({
                 "drug": drug,
                 "weight_values": [],
@@ -281,8 +519,14 @@ if st.button("Run batch extraction for ALL drugs"):
                 "alt_highest_reduction_pct_normalized": None,
                 "alt_score_points": None,
                 "total_points": None,
-                "max_points": 20,
-                "raw_model_output": None
+                # LOT fields
+                "guiding_principle_points": None,
+                "clinical_stage_points": None,
+                "commercial_stage_points": None,
+                "key_differentiator_points": None,
+                "lot_total_points": None,
+                "overall_total_points": None,
+                "max_points": 40
             })
             progress.progress(int(i / n * 100))
             continue
@@ -425,7 +669,6 @@ if st.button("Run batch extraction for ALL drugs"):
         else:
             # fallback to mash_highest if provided
             if 'm_high_norm' in locals() and m_high_norm is not None:
-                # if no flags known, treat as unclear
                 mash_points = score_mash_individual(m_high_norm, None)
                 if not mash_values:
                     mash_values = [m_high_norm]
@@ -438,13 +681,33 @@ if st.button("Run batch extraction for ALL drugs"):
         alt_highest_norm = safe_to_float(alt_highest)
         alt_points = score_alt(alt_highest_norm)
 
-        # total points: sum of the four endpoint points (each endpoint max 5) -> max 20
+        # total points: sum of the four clinical endpoint points (each endpoint max 5) -> max 20
         try:
             total_points = int(weight_points) + int(a1c_points) + int(mash_points) + int(alt_points)
         except Exception:
             total_points = None
 
-        # append row with lists and scores
+        # ---- LOT scoring (use parsed and abstracts) ----
+        guiding_principle_points = score_guiding_principle(parsed if isinstance(parsed, dict) else {}, abstracts)
+        clinical_stage_points = score_clinical_stage(parsed if isinstance(parsed, dict) else {}, abstracts)
+        commercial_stage_points = score_commercial_stage(parsed if isinstance(parsed, dict) else {}, abstracts)
+        key_differentiator_points = score_key_differentiator(parsed if isinstance(parsed, dict) else {}, abstracts)
+
+        try:
+            lot_total_points = int(guiding_principle_points) + int(clinical_stage_points) + \
+                               int(commercial_stage_points) + int(key_differentiator_points)
+        except Exception:
+            lot_total_points = None
+
+        # overall (clinical + lot) total and max
+        overall_total = None
+        try:
+            overall_total = (None if total_points is None or lot_total_points is None
+                             else int(total_points) + int(lot_total_points))
+        except Exception:
+            overall_total = None
+
+        # append row (no raw_model_output)
         rows.append({
             "drug": drug,
             "weight_values": weight_values,
@@ -460,28 +723,35 @@ if st.button("Run batch extraction for ALL drugs"):
             "alt_highest_reduction_pct_normalized": alt_highest_norm,
             "alt_score_points": alt_points,
             "total_points": total_points,
-            "max_points": 20,
-            "raw_model_output": resp_text
+            # LOT fields
+            "guiding_principle_points": guiding_principle_points,
+            "clinical_stage_points": clinical_stage_points,
+            "commercial_stage_points": commercial_stage_points,
+            "key_differentiator_points": key_differentiator_points,
+            "lot_total_points": lot_total_points,
+            "overall_total_points": overall_total,
+            "max_points": 40  # clinical (20) + LOT (20)
         })
 
         progress.progress(int(i / n * 100))
 
     out_df = pd.DataFrame(rows)
 
-    # stringify list-columns so CSV/JSON writes nicely
+    # stringify list-columns so CSV writes nicely
     def stringify_lists(x):
         if isinstance(x, list):
             return json.dumps(x)
         return x
 
     out_df_for_export = out_df.copy()
-    for col in ["weight_values", "weight_individual_scores", "a1c_values", "a1c_individual_scores",
-                "mash_values", "mash_worsening_flags", "mash_individual_scores", "raw_model_output"]:
+    list_cols = ["weight_values", "weight_individual_scores", "a1c_values", "a1c_individual_scores",
+                 "mash_values", "mash_worsening_flags", "mash_individual_scores"]
+    for col in list_cols:
         if col in out_df_for_export.columns:
             out_df_for_export[col] = out_df_for_export[col].apply(stringify_lists)
 
-    st.subheader(f"Results (showing {len(out_df)} drugs; lists are shown as JSON strings in CSV)")
-    st.dataframe(out_df.head(200))  # show more rows in-app for convenience
+    st.subheader(f"Results (showing {len(out_df)} drugs; lists are JSON strings in CSV)")
+    st.dataframe(out_df.head(200))
 
     st.download_button("Download CSV", data=out_df_for_export.to_csv(index=False).encode("utf-8"),
                        file_name=OUTPUT_CSV, mime="text/csv")

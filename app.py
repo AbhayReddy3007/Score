@@ -2,10 +2,12 @@
 """
 Batch per-drug extractor — Gemini 2.5-flash (hardcoded API key)
 
-Replace the value of HARD_CODED_GEMINI_API_KEY below with your real Gemini API key.
+This version asks Gemini to return per-study extracted values for weight loss, A1c, and MASH
+(in arrays) plus highest values. The app computes individual scores for each extracted
+value, shows those lists in the output, and assigns the endpoint points based on the
+highest individual score.
 
-Warning: hardcoding secrets is convenient for local testing but insecure for
-shared code or version control. Remove the key before committing.
+Replace HARD_CODED_GEMINI_API_KEY with your real key.
 """
 import os
 import json
@@ -29,18 +31,23 @@ OUTPUT_CSV = "batch_outcomes.csv"
 HARD_CODED_GEMINI_API_KEY = "YOUR_HARDCODED_GEMINI_KEY_HERE"
 # ----------------------------------------
 
-# Prompt template per drug
+# Prompt template per drug: return arrays of reported values (per study) + highest values
 DATASET_PROMPT_TEMPLATE = (
-    "You are an extractor for clinical research abstracts. I will provide a numbered list of "
-    "abstracts from multiple studies for a single drug.\n\n"
-    "Read all abstracts and return exactly one JSON object (single-line) with the following keys:\n\n"
-    "1) average_weight_loss_pct -> numeric mean of reported weight-loss percentages across abstracts that report it (null if none).\n\n"
-    "2) average_a1c_reduction_pct -> numeric mean of reported A1c absolute reductions (percentage points) across abstracts that report it (null if none).\n\n"
-    "3) mash_highest_resolution_pct -> the HIGHEST percentage of patients reported in any study to have MASH resolution (percent from baseline). Return null if none reported.\n\n"
-    "4) alt_highest_reduction_pct -> the HIGHEST percentage reduction in ALT from baseline reported in any abstract (percent). Return null if none reported.\n\n"
-    "Optionally (only if easy to extract):\n"
-    " - mash_worsening_of_fibrosis -> 'yes'/'no'/'unclear' if any abstracts reported worsening of fibrosis.\n\n"
-    "IMPORTANT: Return ONLY the single JSON object and NOTHING else.\n\n"
+    "You are an extractor for clinical research abstracts for a single drug. I will provide a numbered list "
+    "of abstracts. Read all abstracts and return exactly one JSON object (single-line) with these keys:\n\n"
+    # Weight
+    "1) weight_loss_values -> array of numeric weight-loss percentages reported across the abstracts (e.g. [12.0, 9.5, 22]). If none reported, return an empty array.\n\n"
+    "2) highest_weight_loss_pct -> a single numeric value equal to the HIGHEST reported weight-loss percentage across studies, or null if none.\n\n"
+    # A1c
+    "3) a1c_reduction_values -> array of numeric absolute A1c reductions (percentage points) reported across abstracts (e.g. [1.2, 0.9, 2.3]). If none reported, return an empty array.\n\n"
+    "4) highest_a1c_reduction_pct -> a single numeric value equal to the HIGHEST reported A1c absolute reduction (percentage points), or null if none.\n\n"
+    # MASH (now per-study values + per-study fibrosis flag)
+    "5) mash_values -> array of numeric percentages (per study) representing the percent of patients with MASH resolution reported in each abstract (e.g. [40, 25, 60]). If none reported, return an empty array.\n\n"
+    "6) mash_worsening_flags -> array of strings (per study) aligned to mash_values. Each element should be one of 'yes', 'no', or 'unclear' indicating whether that study reported worsening of fibrosis. If a study did not mention fibrosis worsening, use 'unclear'. If no mash_values, return an empty array for this too.\n\n"
+    "7) mash_highest_resolution_pct -> the HIGHEST percentage of patients reported to have MASH resolution in any study, or null if none.\n\n"
+    # ALT
+    "8) alt_highest_reduction_pct -> the HIGHEST percentage reduction in ALT from baseline reported in any abstract, or null if none.\n\n"
+    "IMPORTANT: Return ONLY the single JSON object and NOTHING else (no commentary). Use numeric values (no percent signs) in arrays and single numbers. Ensure arrays are JSON arrays and aligned where indicated.\n\n"
     "Now analyze these abstracts:\n\n"
     "-----\n"
     "{all_abstracts}\n"
@@ -87,9 +94,9 @@ def safe_to_float(val: Any) -> Optional[float]:
             return None
     if isinstance(val, str):
         s = val.strip()
-        if s == "" or s.lower() in {"null","none","n/a","na"}:
+        if s == "" or s.lower() in {"null", "none", "n/a", "na"}:
             return None
-        s = s.replace("%","").replace(",","")
+        s = s.replace("%", "").replace(",", "")
         try:
             return float(s)
         except Exception:
@@ -102,11 +109,11 @@ def normalize_yes_no_unclear(val: Any) -> Optional[str]:
     if isinstance(val, bool):
         return "yes" if val else "no"
     s = str(val).strip().lower()
-    if s in {"yes","y","true","t"}:
+    if s in {"yes", "y", "true", "t"}:
         return "yes"
-    if s in {"no","n","false","f"}:
+    if s in {"no", "n", "false", "f"}:
         return "no"
-    if s in {"unclear","unknown","maybe","ambiguous","unsure","conflicting","mixed"}:
+    if s in {"unclear", "unknown", "maybe", "ambiguous", "unsure", "conflicting", "mixed"}:
         return "unclear"
     if "worsen" in s or "progress" in s or "fibrosis increased" in s or "fibrosis progression" in s:
         return "yes"
@@ -141,21 +148,31 @@ def score_a1c_reduction(pct: Optional[float]) -> int:
         return 2
     return 1
 
-def score_mash(highest_pct: Optional[float], fibrosis_status: Optional[str]) -> int:
-    pct = safe_to_float(highest_pct)
-    fib = normalize_yes_no_unclear(fibrosis_status) if fibrosis_status is not None else None
-    if pct is None or (isinstance(pct, float) and pct == 0.0):
+def score_mash_individual(pct: Optional[float], fibrosis_flag: Optional[str]) -> int:
+    """
+    Score a single MASH observation, using the study-level fibrosis flag.
+    Rules:
+      - If pct is None or <=0 -> 1
+      - If fibrosis_flag == 'yes' -> 3
+      - If fibrosis_flag == 'no':
+          >=50 -> 5
+          >=30 -> 4
+          else -> 2
+      - If fibrosis_flag == 'unclear' or missing -> 2
+    """
+    pct = safe_to_float(pct)
+    flag = normalize_yes_no_unclear(fibrosis_flag) if fibrosis_flag is not None else None
+    if pct is None or (isinstance(pct, float) and pct <= 0.0):
         return 1
-    if fib is None or fib == "unclear":
-        return 2
-    if fib == "no":
+    if flag == "yes":
+        return 3
+    if flag == "no":
         if pct >= 50:
             return 5
         if pct >= 30:
             return 4
         return 2
-    if fib == "yes":
-        return 3
+    # unclear or missing
     return 2
 
 def score_alt(highest_pct: Optional[float]) -> int:
@@ -179,17 +196,17 @@ st.set_page_config(page_title="Batch per-drug extractor (all drugs)", layout="wi
 st.title("Batch per-drug dataset-level extractor — Gemini 2.5-flash")
 st.markdown(
     "- Upload a CSV or Excel with one abstract per row and a drug identifier column.\n"
-    "- The app will group by drug and compute the four numbers + their scores for **all** drugs."
+    "- The app will group by drug and compute the four metrics + their scores for **all** drugs."
 )
 
-uploaded_file = st.file_uploader("Upload CSV or Excel (xlsx/xls/csv)", type=["csv","xlsx","xls"])
+uploaded_file = st.file_uploader("Upload CSV or Excel (xlsx/xls/csv)", type=["csv", "xlsx", "xls"])
 if not uploaded_file:
     st.info("Upload a file to begin. Required columns: a drug column and 'abstract'.")
     st.stop()
 
 # Read file
 try:
-    if str(uploaded_file.name).lower().endswith((".xls",".xlsx")):
+    if str(uploaded_file.name).lower().endswith((".xls", ".xlsx")):
         df = pd.read_excel(uploaded_file)
     else:
         df = pd.read_csv(uploaded_file)
@@ -200,7 +217,7 @@ except Exception as e:
 # Find columns
 drug_col = None
 for c in df.columns:
-    if c.strip().lower() in {"drug","drug_name","treatment","drugname"}:
+    if c.strip().lower() in {"drug", "drug_name", "treatment", "drugname"}:
         drug_col = c
         break
 if drug_col is None:
@@ -251,16 +268,21 @@ if st.button("Run batch extraction for ALL drugs"):
             st.warning(f"API error for drug '{drug}': {e}")
             rows.append({
                 "drug": drug,
-                "average_weight_loss_pct_normalized": None,
+                "weight_values": [],
+                "weight_individual_scores": [],
                 "weight_score_points": None,
-                "average_a1c_reduction_pct_normalized": None,
+                "a1c_values": [],
+                "a1c_individual_scores": [],
                 "a1c_score_points": None,
-                "mash_highest_resolution_pct_normalized": None,
+                "mash_values": [],
+                "mash_worsening_flags": [],
+                "mash_individual_scores": [],
                 "mash_score_points": None,
                 "alt_highest_reduction_pct_normalized": None,
                 "alt_score_points": None,
                 "total_points": None,
-                "max_points": 20
+                "max_points": 20,
+                "raw_model_output": None
             })
             progress.progress(int(i / n * 100))
             continue
@@ -293,59 +315,175 @@ if st.button("Run batch extraction for ALL drugs"):
                     return d.get(k)
             return None
 
-        # Extract fields safely
-        avg_wt = None
-        avg_a1c = None
-        mash_highest = None
+        # default containers
+        weight_values: List[float] = []
+        weight_scores: List[int] = []
+        weight_points = None
+
+        a1c_values: List[float] = []
+        a1c_scores: List[int] = []
+        a1c_points = None
+
+        mash_values: List[float] = []
+        mash_worsening_flags: List[str] = []
+        mash_scores: List[int] = []
+        mash_points = None
+
         alt_highest = None
-        mash_fibrosis_raw = None
+        alt_points = None
 
+        # Parse model output if dict
         if isinstance(parsed, dict):
-            avg_wt = safe_to_float(parsed.get("average_weight_loss_pct") or
-                                   get_first_key_like(parsed, ["average","weight","loss","pct"]))
-            avg_a1c = safe_to_float(parsed.get("average_a1c_reduction_pct") or
-                                    get_first_key_like(parsed, ["average","a1c","reduction","pct"]))
-            mash_highest = parsed.get("mash_highest_resolution_pct") or \
-                           get_first_key_like(parsed, ["mash","highest","resolution","pct"])
-            alt_highest = parsed.get("alt_highest_reduction_pct") or \
-                          get_first_key_like(parsed, ["alt","highest","reduction","pct"])
-            mash_fibrosis_raw = parsed.get("mash_worsening_of_fibrosis") or \
-                                get_first_key_like(parsed, ["mash","worsen","fibrosis"])
+            # Weight values: try direct key or fallbacks
+            w_vals = parsed.get("weight_loss_values") or get_first_key_like(parsed, ["weight", "loss", "values"])
+            if isinstance(w_vals, list):
+                for v in w_vals:
+                    fv = safe_to_float(v)
+                    if fv is not None:
+                        weight_values.append(fv)
+            # highest weight if provided
+            w_high = parsed.get("highest_weight_loss_pct") or get_first_key_like(parsed, ["highest", "weight", "loss", "pct"])
+            w_high_norm = safe_to_float(w_high)
+            if w_high_norm is not None and (w_high_norm not in weight_values):
+                weight_values.append(w_high_norm)
 
-        # Scores
-        weight_points = score_weight_loss(avg_wt)
-        a1c_points = score_a1c_reduction(avg_a1c)
-        mash_points = score_mash(mash_highest, mash_fibrosis_raw)
-        alt_points = score_alt(alt_highest)
+            # A1c values
+            a_vals = parsed.get("a1c_reduction_values") or get_first_key_like(parsed, ["a1c", "reduction", "values"])
+            if isinstance(a_vals, list):
+                for v in a_vals:
+                    fv = safe_to_float(v)
+                    if fv is not None:
+                        a1c_values.append(fv)
+            # highest a1c
+            a_high = parsed.get("highest_a1c_reduction_pct") or get_first_key_like(parsed, ["highest", "a1c", "reduction", "pct"])
+            a_high_norm = safe_to_float(a_high)
+            if a_high_norm is not None and (a_high_norm not in a1c_values):
+                a1c_values.append(a_high_norm)
 
-        total_points = None
+            # MASH values and aligned worsening flags
+            m_vals = parsed.get("mash_values") or get_first_key_like(parsed, ["mash", "values"])
+            m_flags = parsed.get("mash_worsening_flags") or get_first_key_like(parsed, ["mash", "worsen", "flags", "fibrosis"])
+            if isinstance(m_vals, list):
+                for v in m_vals:
+                    fv = safe_to_float(v)
+                    if fv is not None:
+                        mash_values.append(fv)
+            # if flags provided, align or fill with 'unclear'
+            if isinstance(m_flags, list):
+                for f in m_flags:
+                    mash_worsening_flags.append(normalize_yes_no_unclear(f) or "unclear")
+            # if model provided highest but not array, include it
+            m_high = parsed.get("mash_highest_resolution_pct") or get_first_key_like(parsed, ["mash", "highest", "resolution", "pct"])
+            m_high_norm = safe_to_float(m_high)
+            if m_high_norm is not None and (m_high_norm not in mash_values):
+                mash_values.append(m_high_norm)
+                # if flags shorter than values, append 'unclear' for the highest
+                if len(mash_worsening_flags) < len(mash_values):
+                    mash_worsening_flags.extend(["unclear"] * (len(mash_values) - len(mash_worsening_flags)))
+
+            # ALT highest
+            alt_highest = parsed.get("alt_highest_reduction_pct") or get_first_key_like(parsed, ["alt", "highest", "reduction", "pct"])
+
+        # compute individual scores for weight and pick highest as endpoint points
+        for v in weight_values:
+            weight_scores.append(score_weight_loss(safe_to_float(v)))
+        if len(weight_scores) > 0:
+            weight_points = max(weight_scores)
+        else:
+            if 'w_high_norm' in locals() and w_high_norm is not None:
+                weight_points = score_weight_loss(w_high_norm)
+                if not weight_values:
+                    weight_values = [w_high_norm]
+                    weight_scores = [weight_points]
+            else:
+                weight_points = 0
+
+        # compute individual scores for a1c and pick highest
+        for v in a1c_values:
+            a1c_scores.append(score_a1c_reduction(safe_to_float(v)))
+        if len(a1c_scores) > 0:
+            a1c_points = max(a1c_scores)
+        else:
+            if 'a_high_norm' in locals() and a_high_norm is not None:
+                a1c_points = score_a1c_reduction(a_high_norm)
+                if not a1c_values:
+                    a1c_values = [a_high_norm]
+                    a1c_scores = [a1c_points]
+            else:
+                a1c_points = 0
+
+        # compute individual scores for mash using per-study fibrosis flags
+        # ensure flags list is same length as values
+        if mash_values and (len(mash_worsening_flags) < len(mash_values)):
+            mash_worsening_flags.extend(["unclear"] * (len(mash_values) - len(mash_worsening_flags)))
+
+        for idx, v in enumerate(mash_values):
+            flag = mash_worsening_flags[idx] if idx < len(mash_worsening_flags) else "unclear"
+            mash_scores.append(score_mash_individual(safe_to_float(v), flag))
+        if len(mash_scores) > 0:
+            mash_points = max(mash_scores)
+        else:
+            # fallback to mash_highest if provided
+            if 'm_high_norm' in locals() and m_high_norm is not None:
+                # if no flags known, treat as unclear
+                mash_points = score_mash_individual(m_high_norm, None)
+                if not mash_values:
+                    mash_values = [m_high_norm]
+                    mash_worsening_flags = ["unclear"]
+                    mash_scores = [mash_points]
+            else:
+                mash_points = 0
+
+        # ALT scoring remains based on highest value
+        alt_highest_norm = safe_to_float(alt_highest)
+        alt_points = score_alt(alt_highest_norm)
+
+        # total points: sum of the four endpoint points (each endpoint max 5) -> max 20
         try:
-            # sum scores (each endpoint max 5) -> total max 20
             total_points = int(weight_points) + int(a1c_points) + int(mash_points) + int(alt_points)
         except Exception:
             total_points = None
 
+        # append row with lists and scores
         rows.append({
             "drug": drug,
-            "average_weight_loss_pct_normalized": avg_wt,
+            "weight_values": weight_values,
+            "weight_individual_scores": weight_scores,
             "weight_score_points": weight_points,
-            "average_a1c_reduction_pct_normalized": avg_a1c,
+            "a1c_values": a1c_values,
+            "a1c_individual_scores": a1c_scores,
             "a1c_score_points": a1c_points,
-            "mash_highest_resolution_pct_normalized": safe_to_float(mash_highest),
+            "mash_values": mash_values,
+            "mash_worsening_flags": mash_worsening_flags,
+            "mash_individual_scores": mash_scores,
             "mash_score_points": mash_points,
-            "alt_highest_reduction_pct_normalized": safe_to_float(alt_highest),
+            "alt_highest_reduction_pct_normalized": alt_highest_norm,
             "alt_score_points": alt_points,
             "total_points": total_points,
-            "max_points": 20
+            "max_points": 20,
+            "raw_model_output": resp_text
         })
 
         progress.progress(int(i / n * 100))
 
     out_df = pd.DataFrame(rows)
-    st.subheader("Results (first 50 rows)")
-    st.dataframe(out_df.head(50))
 
-    st.download_button("Download CSV", data=out_df.to_csv(index=False).encode("utf-8"),
+    # stringify list-columns so CSV/JSON writes nicely
+    def stringify_lists(x):
+        if isinstance(x, list):
+            return json.dumps(x)
+        return x
+
+    out_df_for_export = out_df.copy()
+    for col in ["weight_values", "weight_individual_scores", "a1c_values", "a1c_individual_scores",
+                "mash_values", "mash_worsening_flags", "mash_individual_scores", "raw_model_output"]:
+        if col in out_df_for_export.columns:
+            out_df_for_export[col] = out_df_for_export[col].apply(stringify_lists)
+
+    st.subheader(f"Results (showing {len(out_df)} drugs; lists are shown as JSON strings in CSV)")
+    st.dataframe(out_df.head(200))  # show more rows in-app for convenience
+
+    st.download_button("Download CSV", data=out_df_for_export.to_csv(index=False).encode("utf-8"),
                        file_name=OUTPUT_CSV, mime="text/csv")
     st.download_button("Download JSON", data=out_df.to_json(orient="records", indent=2).encode("utf-8"),
                        file_name=OUTPUT_JSON, mime="application/json")

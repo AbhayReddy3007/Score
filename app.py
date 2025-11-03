@@ -1,4 +1,17 @@
+# app.py
+"""
+Batch per-drug extractor — Gemini 2.5-flash (hardcoded API key)
 
+Replace HARD_CODED_GEMINI_API_KEY with your actual Gemini API key.
+
+Behavior:
+- Upload CSV/XLSX with columns: drug (or drug_name) and abstract.
+- Groups rows by drug, concatenates abstracts for each drug, calls Gemini per drug.
+- Extracts per-study arrays for weight, a1c, mash (with fibrosis flags), plus ALT highest.
+- Computes individual scores and assigns endpoint points based on the highest individual score.
+- Adds a Line-Of-Treatment (LOT) table with 4 endpoints (Guiding Principle, Clinical Stage,
+  Commercial Stage, Key Differentiator).
+"""
 import os
 import json
 import re
@@ -140,17 +153,6 @@ def score_a1c_reduction(pct: Optional[float]) -> int:
     return 1
 
 def score_mash_individual(pct: Optional[float], fibrosis_flag: Optional[str]) -> int:
-    """
-    Score a single MASH observation, using the study-level fibrosis flag.
-    Rules:
-      - If pct is None or <=0 -> 1
-      - If fibrosis_flag == 'yes' -> 3
-      - If fibrosis_flag == 'no':
-          >=50 -> 5
-          >=30 -> 4
-          else -> 2
-      - If fibrosis_flag == 'unclear' or missing -> 2
-    """
     pct = safe_to_float(pct)
     flag = normalize_yes_no_unclear(fibrosis_flag) if fibrosis_flag is not None else None
     if pct is None or (isinstance(pct, float) and pct <= 0.0):
@@ -163,7 +165,6 @@ def score_mash_individual(pct: Optional[float], fibrosis_flag: Optional[str]) ->
         if pct >= 30:
             return 4
         return 2
-    # unclear or missing
     return 2
 
 def score_alt(highest_pct: Optional[float]) -> int:
@@ -181,11 +182,10 @@ def score_alt(highest_pct: Optional[float]) -> int:
     return 1
 
 # ---------- Line-of-Treatment (LOT) scoring functions ----------
-# Guiding Principle, Clinical Stage, Commercial Stage implemented per user's mapping.
 def score_guiding_principle(parsed: dict, abstracts: List[str]) -> int:
     parsed = parsed or {}
     abstracts = abstracts or []
-    fulltext = " ".join(abstracts).lower()
+    fulltext = " ".join(str(a) for a in (abstracts or [])).lower()
 
     gp_parsed = None
     if isinstance(parsed, dict):
@@ -239,7 +239,7 @@ def score_guiding_principle(parsed: dict, abstracts: List[str]) -> int:
 def score_clinical_stage(parsed: dict, abstracts: List[str]) -> int:
     parsed = parsed or {}
     abstracts = abstracts or []
-    fulltext = " ".join(abstracts).lower()
+    fulltext = " ".join(str(a) for a in (abstracts or [])).lower()
 
     cs_parsed = None
     if isinstance(parsed, dict):
@@ -288,7 +288,7 @@ def score_clinical_stage(parsed: dict, abstracts: List[str]) -> int:
 def score_commercial_stage(parsed: dict, abstracts: List[str]) -> int:
     parsed = parsed or {}
     abstracts = abstracts or []
-    fulltext = " ".join(abstracts).lower()
+    fulltext = " ".join(str(a) for a in (abstracts or [])).lower()
 
     cm_parsed = None
     if isinstance(parsed, dict):
@@ -342,19 +342,9 @@ def score_commercial_stage(parsed: dict, abstracts: List[str]) -> int:
     return 1
 
 def score_key_differentiator(parsed: dict, abstracts: List[str]) -> int:
-    """
-    Key Differentiator scoring (1-5) based on user rules:
-    5: De facto SOC — clear first choice; formal guideline recommendation as preferred SOC is strongest evidence.
-    4: Major player in early treatment: dominant force in 1L or 2L but less certain/smaller role than 5.
-    3: Established role but not dominant — clear place in algorithm but not market leader across broad population.
-    2: Reserved for later-line use — not mainstream, used later.
-    1: Outside mainstream guideline recommendations — limited to end-of-paradigm, physician discretion.
-
-    Defaults to 1 if nothing matched. Modify to return 0 if you prefer 'no-data'.
-    """
     parsed = parsed or {}
     abstracts = abstracts or []
-    fulltext = " ".join(abstracts).lower()
+    fulltext = " ".join(str(a) for a in (abstracts or [])).lower()
 
     kd_parsed = None
     if isinstance(parsed, dict):
@@ -372,58 +362,45 @@ def score_key_differentiator(parsed: dict, abstracts: List[str]) -> int:
                         break
 
     if kd_parsed:
-        # 5: de facto SOC / preferred SOC in guidelines
-        if re.search(r'\b(preferred (standard of care|soc|first[- ]line|1l)|preferred soc|preferred standard of care|de facto standard|de[- ]facto standard of care|de facto soc|de[- ]facto soc)\b', kd_parsed):
+        if re.search(r'\b(preferred (standard of care|soc|first[- ]line|1l)|preferred soc|preferred standard of care|de facto standard|de[- ]facto standard of care|de facto soc)\b', kd_parsed):
             return 5
         if re.search(r'\b(preferred in guidelines|recommended as preferred|guideline preferred)\b', kd_parsed):
             return 5
 
-        # 4: major player in early treatment (dominant in 1L or 2L)
         if re.search(r'\b(dominant (1l|1st|first[- ]line|2l|second[- ]line)|major player|market leader in (1l|2l)|dominant in (1l|2l))\b', kd_parsed):
             return 4
 
-        # 3: established role but not dominant
         if re.search(r'\b(established role|clear place in treatment|part of the treatment algorithm|used in the algorithm|not market leader)\b', kd_parsed):
             return 3
 
-        # 2: reserved for later-line use
         if re.search(r'\b(later[- ]line|reserved for later|used in later line|used in later lines|3l|third[- ]line|later line use)\b', kd_parsed):
             return 2
 
-        # 1: outside mainstream
         if re.search(r'\b(salvage|limited to end|physician discretion|off label|rarely used|no formal place|limited place)\b', kd_parsed):
             return 1
 
-    # Evaluate abstracts text (strict -> lenient)
-
-    # 5: de facto SOC + guideline preferred mentions
     if (re.search(r'\b(de[- ]facto standard of care|de facto standard of care|de[- ]facto soc|de facto soc|de[- ]facto standard)\b', fulltext)
         and re.search(r'\b(preferred in guidelines|preferred option|guideline preferred|recommended as preferred)\b', fulltext)):
         return 5
     if re.search(r'\b(preferred (standard of care|soc|first[- ]line|1l)|preferred soc|preferred standard of care)\b', fulltext):
         return 5
 
-    # 4: major player in early treatment (dominant 1L or 2L)
     if re.search(r'\b(dominant (1l|1st|first[- ]line|2l|second[- ]line)|major player|market leader in (1l|2l)|dominant in (1l|2l))\b', fulltext):
         return 4
     if re.search(r'\b(major player|widely prescribed in early|widely prescribed in 1l|widely prescribed in 2l|market leader)\b', fulltext):
         return 4
 
-    # 3: established role but not dominant
     if re.search(r'\b(established role|part of the treatment algorithm|used in the treatment algorithm|has a clear place in the algorithm|not market leader)\b', fulltext):
         return 3
     if re.search(r'\b(recommended for a subgroup|recommended in guideline subsection|used for biomarker positive|used in specific subgroup)\b', fulltext):
         return 3
 
-    # 2: reserved for later-line use
     if re.search(r'\b(later[- ]line|reserved for later|used in later line|3l|third[- ]line|used after failure)\b', fulltext):
         return 2
 
-    # 1: outside mainstream guideline recommendations
     if re.search(r'\b(salvage|physician discretion|off[- ]label|rarely used|no formal place|limited place|limited use|end of treatment pathway)\b', fulltext):
         return 1
 
-    # conservative default
     return 1
 
 # ----------------------------
@@ -494,8 +471,11 @@ if st.button("Run batch extraction for ALL drugs"):
 
     rows: List[Dict[str, Any]] = []
     for i, drug in enumerate(unique_drugs, start=1):
-        abstracts = grouped[drug]
-        combined = "\n\n".join([f"{idx+1}. {' '.join(str(a).split())}" for idx, a in enumerate(abstracts)])
+        # ensure every abstract is a string (handles NaN and non-strings safely)
+        abstracts = ["" if a is None or (isinstance(a, float) and pd.isna(a)) else str(a) for a in grouped[drug]]
+
+        # build the combined prompt text (safe, uses cleaned strings)
+        combined = "\n\n".join([f"{idx+1}. {' '.join(a.split())}" for idx, a in enumerate(abstracts)])
         prompt = DATASET_PROMPT_TEMPLATE.replace("{all_abstracts}", combined)
 
         # Call model
@@ -657,7 +637,6 @@ if st.button("Run batch extraction for ALL drugs"):
                 a1c_points = 0
 
         # compute individual scores for mash using per-study fibrosis flags
-        # ensure flags list is same length as values
         if mash_values and (len(mash_worsening_flags) < len(mash_values)):
             mash_worsening_flags.extend(["unclear"] * (len(mash_values) - len(mash_worsening_flags)))
 
@@ -667,7 +646,6 @@ if st.button("Run batch extraction for ALL drugs"):
         if len(mash_scores) > 0:
             mash_points = max(mash_scores)
         else:
-            # fallback to mash_highest if provided
             if 'm_high_norm' in locals() and m_high_norm is not None:
                 mash_points = score_mash_individual(m_high_norm, None)
                 if not mash_values:

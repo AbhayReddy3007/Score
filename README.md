@@ -1,13 +1,8 @@
-import pandas as pd
-
-# Read the CSV file
-df = pd.read_csv("your_file.csv")
-
-# Filter rows where any column contains the word 'MASH' (case-insensitive)
-mash_rows = df[df.apply(lambda row: row.astype(str).str.contains('MASH', case=False, na=False).any(), axis=1)]
-
-# Display the matching rows
-print(mash_rows)
-
-# (Optional) Save the filtered rows to a new CSV file
-mash_rows.to_csv("mash_rows.csv", index=False)
+File "C:\Users\p90022569\Downloads\score\venv\lib\site-packages\streamlit\runtime\scriptrunner\exec_code.py", line 129, in exec_func_with_error_handling
+    result = func()
+File "C:\Users\p90022569\Downloads\score\venv\lib\site-packages\streamlit\runtime\scriptrunner\script_runner.py", line 669, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+File "C:\Users\p90022569\Downloads\score\app.py", line 691, in <module>
+    guiding_principle_points = score_guiding_principle(parsed if isinstance(parsed, dict) else {}, abstracts)
+File "C:\Users\p90022569\Downloads\score\app.py", line 188, in score_guiding_principle
+    fulltext = " ".join(abstracts).lower()

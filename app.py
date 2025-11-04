@@ -9,8 +9,9 @@ Behavior:
 - Groups rows by drug, concatenates abstracts for each drug, calls Gemini per drug.
 - Extracts per-study arrays for weight, a1c, mash (with fibrosis flags), plus ALT highest.
 - Computes individual scores and assigns endpoint points based on the highest individual score.
-- Adds a Line-Of-Treatment (LOT) table with 4 endpoints (Guiding Principle, Clinical Stage,
-  Commercial Stage, Key Differentiator).
+- Adds a Line-Of-Treatment (LOT) table with 4 endpoints.
+  The LOT definitions are passed verbatim to the LLM in the prompt (Guiding Principle,
+  Clinical Stage Criteria, Commercial Stage, Key Differentiator).
 """
 import os
 import json
@@ -35,7 +36,39 @@ OUTPUT_CSV = "batch_outcomes.csv"
 HARD_CODED_GEMINI_API_KEY = "YOUR_HARDCODED_GEMINI_KEY_HERE"
 # ----------------------------------------
 
-# Prompt template per drug: return arrays of reported values (per study) + highest values
+# -------------------------
+# PROMPT: includes L0T definitions verbatim (user-supplied)
+# -------------------------
+LOT_DEFINITIONS_TEXT = """
+GUIDING PRINCIPLE:
+5: The asset is positioned to become the undisputed first-line (1L) standard of care, displacing previous therapies. This status is ideally confirmed by top-tier clinical guidelines.
+4: The asset is a strong first-line (1L) alternative or the dominant second-line (2L) choice. It will capture a very significant share of the early treatment market, a position often supported by guidelines.
+3: The asset is a solid second-line (2L) option or guideline-recommended 1L choice for a specific, well-defined sub-population. The role is often clarified and supported by guideline recommendations.
+2: The asset is primarily a third-line (3L) therapy, used only after patients have failed standard first and second-line options, a position typically defined by guidelines.
+1: The asset is relegated to salvage therapy or is a niche option used only in very late lines of treatment, often with limited or no mention in major guidelines.
+
+CLINICAL STAGE CRITERIA:
+5: The asset's profile is so compelling (transformative efficacy and clean safety) that it is widely expected to become the new SOC. The expectation is often supported by its inclusion as a preferred option in draft guidelines or expert consensus.
+4: The profile is strong enough to be a competitive 1L choice, or it is positioned to be the go-to 2L therapy. This is often evidenced by its inclusion in guidelines as a recommended option.
+3: The data supports use in the 2L setting or in a niche 1L group (e.g., biomarker positive patients). This position is often solidified by its inclusion in guideline subsections.
+2: The trial design and data position the asset for use in a treatment-resistant (3L or later) population.
+1: The asset is being developed for a very small, highly refractory population who have exhausted all other available options.
+
+COMMERCIAL STAGE:
+5: The asset is the most prescribed 1L therapy and is explicitly recommended in major clinical guidelines as the preferred or sole first-line SOC.
+4: The asset is widely adopted as a common 1L option and is recommended in guidelines as a peer to the SOC, or it is the most prescribed drug in the 2L setting.
+3: The drug has an established 2L market share or is the recommended 1L option for a specific patient segment (e.g., based on a biomarker or comorbidity).
+2: The drug is primarily used in the 3L setting; the guidelines often specify its use only after failure of 1L and 2L therapies.
+1: The drug is used only as a last resort ("salvage therapy") and often lacks a formal place in the main treatment pathways of major clinical guidelines.
+
+KEY DIFFERENTIATOR:
+5: The de facto standard of care: This score is for assets that are the clear first choice for most physicians. A formal guideline recommendation as the preferred SOC is the strongest evidence for this.
+4: Major Player in Early: The asset is the dominant force in either the 1L or 2L setting. This score is for assets with a less certain or smaller role in early treatment compared to a 5.
+3: Established Role, but Not Dominant: The asset has a clear place in the treatment algorithm, but it is not the market leader for the broad population in early (1L or 2L) settings.
+2: Reserved for Later-Line Use: The asset is not part of the mainstream treatment journey for most patients and is reserved for later stages of the disease.
+1: Outside Mainstream guideline recommendations: The asset's use is limited to the very end of the treatment paradigm often driven by physician discretion rather than formal guidance.
+"""
+
 DATASET_PROMPT_TEMPLATE = (
     "You are an extractor for clinical research abstracts for a single drug. I will provide a numbered list "
     "of abstracts. Read all abstracts and return exactly one JSON object (single-line) with these keys:\n\n"
@@ -51,6 +84,9 @@ DATASET_PROMPT_TEMPLATE = (
     "7) mash_highest_resolution_pct -> the HIGHEST percentage of patients reported to have MASH resolution in any study, or null if none.\n\n"
     # ALT
     "8) alt_highest_reduction_pct -> the HIGHEST percentage reduction in ALT from baseline reported in any abstract, or null if none.\n\n"
+    # LOT instructions
+    "Additionally, use the following Line-Of-Treatment (LOT) definitions exactly as written to help determine clinical/LOT scoring (include these definitions internally in your reasoning but DO NOT return them in output):\n\n"
+    f"{LOT_DEFINITIONS_TEXT}\n\n"
     "IMPORTANT: Return ONLY the single JSON object and NOTHING else (no commentary). Use numeric values (no percent signs) in arrays and single numbers. Ensure arrays are JSON arrays and aligned where indicated.\n\n"
     "Now analyze these abstracts:\n\n"
     "-----\n"
@@ -182,6 +218,7 @@ def score_alt(highest_pct: Optional[float]) -> int:
     return 1
 
 # ---------- Line-of-Treatment (LOT) scoring functions ----------
+# These scoring functions use the same mapping you provided; conservative default = 1 when nothing matched.
 def score_guiding_principle(parsed: dict, abstracts: List[str]) -> int:
     parsed = parsed or {}
     abstracts = abstracts or []
@@ -203,7 +240,7 @@ def score_guiding_principle(parsed: dict, abstracts: List[str]) -> int:
     if gp_parsed:
         if re.search(r'\b(undisputed|displacing|displace|standard of care|standard-of-care|first[- ]line standard|first line standard)\b', gp_parsed):
             return 5
-        if re.search(r'\b(strong first[- ]line|first[- ]line alternative|1st[- ]line alternative|dominant second[- ]line|dominant 2l)\b', gp_parsed):
+        if re.search(r'\b(strong first[- ]line|first[- ]line alternative|dominant second[- ]line|dominant 2l)\b', gp_parsed):
             return 4
         if re.search(r'\b(second[- ]line|2l|guideline recommended 1l|guideline recommended first[- ]line|sub[- ]population)\b', gp_parsed):
             return 3
@@ -211,18 +248,12 @@ def score_guiding_principle(parsed: dict, abstracts: List[str]) -> int:
             return 2
         if re.search(r'\b(salvage|niche|late[- ]line|palliative|limited mention)\b', gp_parsed):
             return 1
-        if re.search(r'\b1l\b', gp_parsed):
-            return 4
-        if re.search(r'\b2l\b', gp_parsed):
-            return 3
-        if re.search(r'\b3l\b', gp_parsed):
-            return 2
 
-    if (re.search(r'\b(undisputed|displacing|displace|dominant standard of care|first[- ]line standard|standard of care|standard-of-care)\b', fulltext)
+    if (re.search(r'\b(undisputed|displacing|dominant standard of care|first[- ]line standard|standard of care|standard-of-care)\b', fulltext)
         and re.search(r'\b(guideline|guidelines|recommended|recommendation|soc|top[- ]tier)\b', fulltext)):
         return 5
 
-    if re.search(r'\b(strong first[- ]line|first[- ]line alternative|1st[- ]line alternative|dominant second[- ]line|dominant 2l|capture (a )?(significant|large) share)\b', fulltext):
+    if re.search(r'\b(strong first[- ]line|first[- ]line alternative|dominant second[- ]line|capture (a )?(significant|large) share)\b', fulltext):
         return 4
 
     if re.search(r'\b(second[- ]line|2l|recommended (as )?first[- ]line for|guideline (recommended|recommends).*first[- ]line|for (patients|subgroup|sub-population))\b', fulltext):
@@ -483,7 +514,6 @@ if st.button("Run batch extraction for ALL drugs"):
             response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
         except Exception as e:
             st.warning(f"API error for drug '{drug}': {e}")
-            # append row with empty/default fields (no raw_model_output)
             rows.append({
                 "drug": drug,
                 "weight_values": [],
@@ -511,7 +541,7 @@ if st.button("Run batch extraction for ALL drugs"):
             progress.progress(int(i / n * 100))
             continue
 
-        # Extract text
+        # Extract model output string
         resp_text = ""
         if hasattr(response, "text") and response.text:
             resp_text = response.text

@@ -2,15 +2,13 @@
 """
 Batch per-drug extractor — Gemini 2.5-flash (hardcoded API key)
 
-Replace HARD_CODED_GEMINI_API_KEY with your actual Gemini API key.
-
-Behavior:
-- Upload CSV/XLSX with columns: drug (or drug_name) and abstract.
-- Groups rows by drug, concatenates abstracts for each drug, calls Gemini per drug.
-- Extracts per-study arrays for weight, a1c, mash (with fibrosis flags kept but ignored for scoring), plus ALT highest.
-- Computes individual scores and assigns endpoint points based on the highest individual score.
-- Adds a Line-Of-Treatment (LOT) table with 4 endpoints (Guiding Principle, Clinical Stage,
-  Commercial Stage, Key Differentiator) and includes your verbatim definitions in the prompt.
+Changes:
+- Numeric endpoints (weight, a1c, mash, alt) now compute the AVERAGE of extracted values
+  and score based on that average.
+- MASH: strict behavior — do NOT use mash_highest as a fallback. Only average explicit mash_values.
+- Weight & A1c: average the array; if model provided a highest_* single value it's included in the array
+  (keeps previous tolerant behavior for these endpoints).
+- ALT: if model returns alt_values, average them; otherwise use alt_highest single value.
 """
 import os
 import json
@@ -19,6 +17,7 @@ from typing import Optional, Any, Dict, List
 
 import streamlit as st
 import pandas as pd
+import math
 
 # Lazy import for better error if missing
 try:
@@ -82,7 +81,8 @@ DATASET_PROMPT_TEMPLATE = (
     "6) mash_worsening_flags -> array of strings (per study) aligned to mash_values. Each element should be one of 'yes', 'no', or 'unclear' indicating whether that study reported worsening of fibrosis. If a study did not mention fibrosis worsening, use 'unclear'. If no mash_values, return an empty array for this too.\n\n"
     "7) mash_highest_resolution_pct -> the HIGHEST percentage of patients reported to have MASH resolution in any study, or null if none.\n\n"
     # ALT
-    "8) alt_highest_reduction_pct -> the HIGHEST percentage reduction in ALT from baseline reported in any abstract, or null if none.\n\n"
+    "8) alt_values -> optional array of numeric percent reductions in ALT per study (e.g. [35, 12]). If none reported, return an empty array.\n\n"
+    "9) alt_highest_reduction_pct -> the HIGHEST percentage reduction in ALT from baseline reported in any abstract, or null if none.\n\n"
     # LOT instructions
     "Additionally, use the following Line-Of-Treatment (LOT) definitions exactly as written to help determine clinical/LOT scoring (include these definitions internally in your reasoning but DO NOT return them in output):\n\n"
     f"{LOT_DEFINITIONS_TEXT}\n\n"
@@ -128,6 +128,8 @@ def safe_to_float(val: Any) -> Optional[float]:
         return None
     if isinstance(val, (int, float)):
         try:
+            if isinstance(val, bool):
+                return None
             return float(val)
         except Exception:
             return None
@@ -135,7 +137,7 @@ def safe_to_float(val: Any) -> Optional[float]:
         s = val.strip()
         if s == "" or s.lower() in {"null", "none", "n/a", "na"}:
             return None
-        s = s.replace("%", "").replace(",", "")
+        s = s.replace("%", "").replace(",", "").replace("≈", "").replace("~", "")
         try:
             return float(s)
         except Exception:
@@ -160,72 +162,74 @@ def normalize_yes_no_unclear(val: Any) -> Optional[str]:
         return "no"
     return "unclear"
 
+def mean_of_list(vals: List[float]) -> Optional[float]:
+    if not vals:
+        return None
+    clean = [v for v in vals if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    if not clean:
+        return None
+    return sum(clean) / len(clean)
+
 # ---- Scoring (your bins) ----
 def score_weight_loss(pct: Optional[float]) -> int:
     if pct is None:
         return 0
     if pct >= 22:
         return 5
-    if 16 <= pct <= 21.9:
+    if pct >= 16:
         return 4
-    if 10 <= pct <= 15.9:
+    if pct >= 10:
         return 3
-    if 5 <= pct <= 9.9:
+    if pct >= 5:
         return 2
-    return 1
+    if pct > 0:
+        return 1
+    return 0
 
 def score_a1c_reduction(pct: Optional[float]) -> int:
     if pct is None:
         return 0
     if pct >= 2.2:
         return 5
-    if 1.8 <= pct <= 2.1:
+    if pct >= 1.8:
         return 4
-    if 1.2 <= pct <= 1.7:
+    if pct >= 1.2:
         return 3
-    if 0.8 <= pct <= 1.1:
+    if pct >= 0.8:
         return 2
-    return 1
+    if pct > 0:
+        return 1
+    return 0
 
 def score_mash_pct(pct: Optional[float]) -> int:
-    """
-    Score MASH based ONLY on the reported percentage (ignore any fibrosis/worsening flags).
-    Mapping:
-      >=50   -> 5
-      30-49.9 -> 4
-      15-29.9 -> 3
-      1-14.9  -> 2
-      None or <=0 -> 1
-    """
     pct = safe_to_float(pct)
     if pct is None or pct <= 0:
         return 1
     if pct >= 50:
         return 5
-    if 30 <= pct < 50:
+    if pct >= 30:
         return 4
-    if 15 <= pct < 30:
+    if pct >= 15:
         return 3
-    if 0 < pct < 15:
+    if pct > 0:
         return 2
     return 1
 
 def score_alt(highest_pct: Optional[float]) -> int:
     pct = safe_to_float(highest_pct)
-    if pct is None or (isinstance(pct, float) and pct <= 0.0):
+    if pct is None or pct <= 0.0:
         return 1
     if pct > 50:
         return 5
-    if 30 <= pct <= 50:
+    if pct >= 30:
         return 4
-    if 15 <= pct <= 29:
+    if pct >= 15:
         return 3
-    if 0 < pct < 15:
+    if pct > 0:
         return 2
     return 1
 
 # ---------- Line-of-Treatment (LOT) scoring functions ----------
-# These scoring functions use the same mapping you provided; conservative default = 1 when nothing matched.
 def score_guiding_principle(parsed: dict, abstracts: List[str]) -> int:
     parsed = parsed or {}
     abstracts = abstracts or []
@@ -523,17 +527,18 @@ if st.button("Run batch extraction for ALL drugs"):
             st.warning(f"API error for drug '{drug}': {e}")
             rows.append({
                 "drug": drug,
+                # clinical endpoints
                 "weight_values": [],
-                "weight_individual_scores": [],
+                "weight_avg_pct": None,
                 "weight_score_points": None,
                 "a1c_values": [],
-                "a1c_individual_scores": [],
+                "a1c_avg_pct": None,
                 "a1c_score_points": None,
                 "mash_values": [],
-                "mash_worsening_flags": [],
-                "mash_individual_scores": [],
+                "mash_avg_pct": None,
                 "mash_score_points": None,
-                "alt_highest_reduction_pct_normalized": None,
+                "alt_values": [],
+                "alt_avg_pct": None,
                 "alt_score_points": None,
                 "total_points": None,
                 # LOT fields
@@ -578,20 +583,17 @@ if st.button("Run batch extraction for ALL drugs"):
 
         # default containers
         weight_values: List[float] = []
-        weight_scores: List[int] = []
-        weight_points = None
-
         a1c_values: List[float] = []
-        a1c_scores: List[int] = []
-        a1c_points = None
-
         mash_values: List[float] = []
         mash_worsening_flags: List[str] = []
-        mash_scores: List[int] = []
-        mash_points = None
+        alt_values: List[float] = []
 
-        alt_highest = None
-        alt_points = None
+        # extracted single-highest fallbacks (we will include them into arrays except for MASH)
+        w_high_norm = None
+        a_high_norm = None
+        # For MASH we will parse m_high_norm but NOT use it as fallback (per your request)
+        m_high_norm = None
+        alt_high_norm = None
 
         # Parse model output if dict
         if isinstance(parsed, dict):
@@ -602,7 +604,7 @@ if st.button("Run batch extraction for ALL drugs"):
                     fv = safe_to_float(v)
                     if fv is not None:
                         weight_values.append(fv)
-            # highest weight if provided
+            # highest weight if provided (we will include into array for averaging)
             w_high = parsed.get("highest_weight_loss_pct") or get_first_key_like(parsed, ["highest", "weight", "loss", "pct"])
             w_high_norm = safe_to_float(w_high)
             if w_high_norm is not None and (w_high_norm not in weight_values):
@@ -615,13 +617,13 @@ if st.button("Run batch extraction for ALL drugs"):
                     fv = safe_to_float(v)
                     if fv is not None:
                         a1c_values.append(fv)
-            # highest a1c
+            # highest a1c (include in array for averaging)
             a_high = parsed.get("highest_a1c_reduction_pct") or get_first_key_like(parsed, ["highest", "a1c", "reduction", "pct"])
             a_high_norm = safe_to_float(a_high)
             if a_high_norm is not None and (a_high_norm not in a1c_values):
                 a1c_values.append(a_high_norm)
 
-            # MASH values and aligned worsening flags (flags preserved but ignored for scoring)
+            # MASH values and aligned worsening flags (flags preserved but ignored for scoring; do NOT use mash_highest fallback)
             m_vals = parsed.get("mash_values") or get_first_key_like(parsed, ["mash", "values"])
             m_flags = parsed.get("mash_worsening_flags") or get_first_key_like(parsed, ["mash", "worsen", "flags", "fibrosis"])
             if isinstance(m_vals, list):
@@ -629,72 +631,37 @@ if st.button("Run batch extraction for ALL drugs"):
                     fv = safe_to_float(v)
                     if fv is not None:
                         mash_values.append(fv)
-            # if flags provided, align or fill with 'unclear'
             if isinstance(m_flags, list):
                 for f in m_flags:
                     mash_worsening_flags.append(normalize_yes_no_unclear(f) or "unclear")
-            # if model provided highest but not array, include it
+            # parse mash_highest but DO NOT append to mash_values
             m_high = parsed.get("mash_highest_resolution_pct") or get_first_key_like(parsed, ["mash", "highest", "resolution", "pct"])
             m_high_norm = safe_to_float(m_high)
-            if m_high_norm is not None and (m_high_norm not in mash_values):
-                mash_values.append(m_high_norm)
-                # if flags shorter than values, append 'unclear' for the highest
-                if len(mash_worsening_flags) < len(mash_values):
-                    mash_worsening_flags.extend(["unclear"] * (len(mash_values) - len(mash_worsening_flags)))
 
-            # ALT highest
-            alt_highest = parsed.get("alt_highest_reduction_pct") or get_first_key_like(parsed, ["alt", "highest", "reduction", "pct"])
+            # ALT: prefer alt_values array if present, otherwise read alt_highest
+            alt_vals = parsed.get("alt_values") or get_first_key_like(parsed, ["alt", "values"])
+            if isinstance(alt_vals, list):
+                for v in alt_vals:
+                    fv = safe_to_float(v)
+                    if fv is not None:
+                        alt_values.append(fv)
+            alt_high = parsed.get("alt_highest_reduction_pct") or get_first_key_like(parsed, ["alt", "highest", "reduction", "pct"])
+            alt_high_norm = safe_to_float(alt_high)
+            if alt_high_norm is not None and (not alt_values):
+                # if no alt_values array, we'll use the single highest as the avg (single-sample)
+                alt_values.append(alt_high_norm)
 
-        # compute individual scores for weight and pick highest as endpoint points
-        for v in weight_values:
-            weight_scores.append(score_weight_loss(safe_to_float(v)))
-        if len(weight_scores) > 0:
-            weight_points = max(weight_scores)
-        else:
-            if 'w_high_norm' in locals() and w_high_norm is not None:
-                weight_points = score_weight_loss(w_high_norm)
-                if not weight_values:
-                    weight_values = [w_high_norm]
-                    weight_scores = [weight_points]
-            else:
-                weight_points = 0
+        # Compute averages (mean) for numeric endpoints
+        weight_avg = mean_of_list(weight_values)
+        a1c_avg = mean_of_list(a1c_values)
+        mash_avg = mean_of_list(mash_values)  # strict: only from explicit mash_values array
+        alt_avg = mean_of_list(alt_values)
 
-        # compute individual scores for a1c and pick highest
-        for v in a1c_values:
-            a1c_scores.append(score_a1c_reduction(safe_to_float(v)))
-        if len(a1c_scores) > 0:
-            a1c_points = max(a1c_scores)
-        else:
-            if 'a_high_norm' in locals() and a_high_norm is not None:
-                a1c_points = score_a1c_reduction(a_high_norm)
-                if not a1c_values:
-                    a1c_values = [a_high_norm]
-                    a1c_scores = [a1c_points]
-            else:
-                a1c_points = 0
-
-        # compute individual scores for mash using ONLY percentage (flags ignored for scoring)
-        if mash_values and (len(mash_worsening_flags) < len(mash_values)):
-            mash_worsening_flags.extend(["unclear"] * (len(mash_values) - len(mash_worsening_flags)))
-
-        for v in mash_values:
-            mash_scores.append(score_mash_pct(safe_to_float(v)))
-        if len(mash_scores) > 0:
-            mash_points = max(mash_scores)
-        else:
-            # fallback to mash_highest if provided
-            if 'm_high_norm' in locals() and m_high_norm is not None:
-                mash_points = score_mash_pct(m_high_norm)
-                if not mash_values:
-                    mash_values = [m_high_norm]
-                    mash_worsening_flags = ["unclear"]
-                    mash_scores = [mash_points]
-            else:
-                mash_points = 0
-
-        # ALT scoring remains based on highest value
-        alt_highest_norm = safe_to_float(alt_highest)
-        alt_points = score_alt(alt_highest_norm)
+        # Scores based on averages (score functions unchanged)
+        weight_points = score_weight_loss(weight_avg)
+        a1c_points = score_a1c_reduction(a1c_avg)
+        mash_points = score_mash_pct(mash_avg) if mash_avg is not None else 0  # if no explicit values -> 0
+        alt_points = score_alt(alt_avg)
 
         # total points: sum of the four clinical endpoint points (each endpoint max 5) -> max 20
         try:
@@ -725,18 +692,24 @@ if st.button("Run batch extraction for ALL drugs"):
         # append row (no raw_model_output)
         rows.append({
             "drug": drug,
+            # weight
             "weight_values": weight_values,
-            "weight_individual_scores": weight_scores,
+            "weight_avg_pct": weight_avg,
             "weight_score_points": weight_points,
+            # a1c
             "a1c_values": a1c_values,
-            "a1c_individual_scores": a1c_scores,
+            "a1c_avg_pct": a1c_avg,
             "a1c_score_points": a1c_points,
+            # mash (strict: only explicit array)
             "mash_values": mash_values,
-            "mash_worsening_flags": mash_worsening_flags,
-            "mash_individual_scores": mash_scores,
+            "mash_avg_pct": mash_avg,
             "mash_score_points": mash_points,
-            "alt_highest_reduction_pct_normalized": alt_highest_norm,
+            "mash_worsening_flags": mash_worsening_flags,
+            # alt
+            "alt_values": alt_values,
+            "alt_avg_pct": alt_avg,
             "alt_score_points": alt_points,
+            # totals
             "total_points": total_points,
             # LOT fields
             "guiding_principle_points": guiding_principle_points,
@@ -759,8 +732,7 @@ if st.button("Run batch extraction for ALL drugs"):
         return x
 
     out_df_for_export = out_df.copy()
-    list_cols = ["weight_values", "weight_individual_scores", "a1c_values", "a1c_individual_scores",
-                 "mash_values", "mash_worsening_flags", "mash_individual_scores"]
+    list_cols = ["weight_values", "a1c_values", "mash_values", "mash_worsening_flags", "alt_values"]
     for col in list_cols:
         if col in out_df_for_export.columns:
             out_df_for_export[col] = out_df_for_export[col].apply(stringify_lists)

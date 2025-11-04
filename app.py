@@ -7,11 +7,10 @@ Replace HARD_CODED_GEMINI_API_KEY with your actual Gemini API key.
 Behavior:
 - Upload CSV/XLSX with columns: drug (or drug_name) and abstract.
 - Groups rows by drug, concatenates abstracts for each drug, calls Gemini per drug.
-- Extracts per-study arrays for weight, a1c, mash (with fibrosis flags), plus ALT highest.
+- Extracts per-study arrays for weight, a1c, mash (with fibrosis flags kept but ignored for scoring), plus ALT highest.
 - Computes individual scores and assigns endpoint points based on the highest individual score.
-- Adds a Line-Of-Treatment (LOT) table with 4 endpoints.
-  The LOT definitions are passed verbatim to the LLM in the prompt (Guiding Principle,
-  Clinical Stage Criteria, Commercial Stage, Key Differentiator).
+- Adds a Line-Of-Treatment (LOT) table with 4 endpoints (Guiding Principle, Clinical Stage,
+  Commercial Stage, Key Differentiator) and includes your verbatim definitions in the prompt.
 """
 import os
 import json
@@ -37,7 +36,7 @@ HARD_CODED_GEMINI_API_KEY = "YOUR_HARDCODED_GEMINI_KEY_HERE"
 # ----------------------------------------
 
 # -------------------------
-# PROMPT: includes L0T definitions verbatim (user-supplied)
+# PROMPT: includes LOT definitions verbatim (user-supplied)
 # -------------------------
 LOT_DEFINITIONS_TEXT = """
 GUIDING PRINCIPLE:
@@ -188,20 +187,28 @@ def score_a1c_reduction(pct: Optional[float]) -> int:
         return 2
     return 1
 
-def score_mash_individual(pct: Optional[float], fibrosis_flag: Optional[str]) -> int:
+def score_mash_pct(pct: Optional[float]) -> int:
+    """
+    Score MASH based ONLY on the reported percentage (ignore any fibrosis/worsening flags).
+    Mapping:
+      >=50   -> 5
+      30-49.9 -> 4
+      15-29.9 -> 3
+      1-14.9  -> 2
+      None or <=0 -> 1
+    """
     pct = safe_to_float(pct)
-    flag = normalize_yes_no_unclear(fibrosis_flag) if fibrosis_flag is not None else None
-    if pct is None or (isinstance(pct, float) and pct <= 0.0):
+    if pct is None or pct <= 0:
         return 1
-    if flag == "yes":
+    if pct >= 50:
+        return 5
+    if 30 <= pct < 50:
+        return 4
+    if 15 <= pct < 30:
         return 3
-    if flag == "no":
-        if pct >= 50:
-            return 5
-        if pct >= 30:
-            return 4
+    if 0 < pct < 15:
         return 2
-    return 2
+    return 1
 
 def score_alt(highest_pct: Optional[float]) -> int:
     pct = safe_to_float(highest_pct)
@@ -614,7 +621,7 @@ if st.button("Run batch extraction for ALL drugs"):
             if a_high_norm is not None and (a_high_norm not in a1c_values):
                 a1c_values.append(a_high_norm)
 
-            # MASH values and aligned worsening flags
+            # MASH values and aligned worsening flags (flags preserved but ignored for scoring)
             m_vals = parsed.get("mash_values") or get_first_key_like(parsed, ["mash", "values"])
             m_flags = parsed.get("mash_worsening_flags") or get_first_key_like(parsed, ["mash", "worsen", "flags", "fibrosis"])
             if isinstance(m_vals, list):
@@ -666,18 +673,18 @@ if st.button("Run batch extraction for ALL drugs"):
             else:
                 a1c_points = 0
 
-        # compute individual scores for mash using per-study fibrosis flags
+        # compute individual scores for mash using ONLY percentage (flags ignored for scoring)
         if mash_values and (len(mash_worsening_flags) < len(mash_values)):
             mash_worsening_flags.extend(["unclear"] * (len(mash_values) - len(mash_worsening_flags)))
 
-        for idx, v in enumerate(mash_values):
-            flag = mash_worsening_flags[idx] if idx < len(mash_worsening_flags) else "unclear"
-            mash_scores.append(score_mash_individual(safe_to_float(v), flag))
+        for v in mash_values:
+            mash_scores.append(score_mash_pct(safe_to_float(v)))
         if len(mash_scores) > 0:
             mash_points = max(mash_scores)
         else:
+            # fallback to mash_highest if provided
             if 'm_high_norm' in locals() and m_high_norm is not None:
-                mash_points = score_mash_individual(m_high_norm, None)
+                mash_points = score_mash_pct(m_high_norm)
                 if not mash_values:
                     mash_values = [m_high_norm]
                     mash_worsening_flags = ["unclear"]
